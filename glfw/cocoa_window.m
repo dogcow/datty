@@ -37,7 +37,6 @@
 #include <float.h>
 #include <string.h>
 #include <assert.h>
-#import <objc/runtime.h>
 
 #define debug debug_rendering
 
@@ -597,241 +596,44 @@ translateKey(uint16_t vk_key, bool apply_keymap) {
     return ans;
 }
 
-static bool cocoa_inline_tab_sync_active = false;
-static bool cocoa_aligning_inline_tabs = false;
-static bool cocoa_have_preserved_content_height = false;
-static CGFloat cocoa_preserved_content_height = 0;
-
-static NSTitlebarAccessoryViewController *
-tab_bar_accessory(NSWindow *nsw) {
-    id accessory = [nsw valueForKey:@"_tabBarAccessoryViewController"];
-    if ([accessory isKindOfClass:[NSTitlebarAccessoryViewController class]]) return accessory;
-    return nil;
-}
-
-static CGFloat cocoa_system_titlebar_height = 0;
-
-static CGFloat
-current_titlebar_height(NSWindow *nsw) {
-    SEL sel = NSSelectorFromString(@"titlebarHeight");
-    if (![nsw respondsToSelector:sel]) return 0;
-    CGFloat (*imp)(id, SEL) = (CGFloat (*)(id, SEL))[nsw methodForSelector:sel];
-    return imp(nsw, sel);
-}
-
-static void
-set_titlebar_height(NSWindow *nsw, CGFloat height) {
-    if (fabs(current_titlebar_height(nsw) - height) < 0.5) return;
-    SEL sel = NSSelectorFromString(@"setTitlebarHeight:");
-    if (![nsw respondsToSelector:sel]) return;
-    void (*imp)(id, SEL, CGFloat) = (void (*)(id, SEL, CGFloat))[nsw methodForSelector:sel];
-    imp(nsw, sel, height);
-}
-
 static bool
-wants_inline_titlebar_tabs(_GLFWwindow *window) {
-    NSWindow *nsw = window->ns.object;
-    if (!nsw || window->ns.layer_shell.is_active || window->floating || !window->decorated || window->ns.titlebar_hidden) return false;
-    return nsw.tabGroup.windows.count > 1;
-}
-
-static void
-layout_inline_tab_content(_GLFWwindow *window) {
-    NSWindow *nsw = window->ns.object;
-    NSView *view = window->ns.view;
-    NSView *container = nsw.contentView;
-    if (!view || container == view) return;
-    NSRect in_container = [container convertRect:nsw.contentLayoutRect fromView:nil];
-    if (!NSEqualRects(view.frame, in_container)) view.frame = in_container;
-    const NSRect fb = [view convertRectToBacking:view.bounds];
-    const int fw = (int)fb.size.width, fh = (int)fb.size.height;
-    const int w = (int)in_container.size.width, h = (int)in_container.size.height;
-    if (fw != window->ns.fbWidth || fh != window->ns.fbHeight) {
-        window->ns.fbWidth = fw;
-        window->ns.fbHeight = fh;
-        _glfwInputFramebufferSize(window, fw, fh);
-    }
-    if (w != window->ns.width || h != window->ns.height) {
-        window->ns.width = w;
-        window->ns.height = h;
-        _glfwInputWindowSize(window, w, h);
-    }
-}
-
-@interface GLFWInlineTabContainerView : NSView
-@end
-
-@implementation GLFWInlineTabContainerView
-- (NSView *)dattyContent {
-    for (NSView *sub in self.subviews) {
-        if ([sub respondsToSelector:@selector(glfwWindow)]) return sub;
-    }
-    return nil;
-}
-- (void)keyDown:(NSEvent *)event {
-    NSView *child = [self dattyContent];
-    if (child) [child keyDown:event];
-}
-- (void)keyUp:(NSEvent *)event {
-    NSView *child = [self dattyContent];
-    if (child) [child keyUp:event];
-}
-- (void)flagsChanged:(NSEvent *)event {
-    NSView *child = [self dattyContent];
-    if (child) [child flagsChanged:event];
-}
-@end
-
-static NSView *
-find_tall_tab_bar(NSView *view) {
-    Class kind = NSClassFromString(@"NSTabBar");
-    if (!view || !kind) return nil;
-    if ([view isKindOfClass:kind] && view.frame.size.height > 1) return view;
-    for (NSView *sub in view.subviews) {
-        NSView *found = find_tall_tab_bar(sub);
-        if (found) return found;
-    }
-    return nil;
-}
-
-static void align_inline_tab_bar(NSWindow *nsw);
-
-@interface GLFWInlineTabBarFix : NSObject
-- (void)slotFrameChanged:(NSNotification *)note;
-@end
-
-@implementation GLFWInlineTabBarFix
-- (void)slotFrameChanged:(NSNotification *)note {
-    if (cocoa_inline_tab_sync_active || cocoa_aligning_inline_tabs) return;
-    NSView *slot = note.object;
-    if (slot.frame.size.height >= 1.0) return;
-    align_inline_tab_bar(slot.window);
-}
-@end
-
-static GLFWInlineTabBarFix *cocoa_inline_tab_bar_fix = nil;
-static const void *kInlineTabSlotWatch = &kInlineTabSlotWatch;
-
-static void
-watch_inline_tab_slot(NSView *slot) {
-    if (!slot || objc_getAssociatedObject(slot, kInlineTabSlotWatch)) return;
-    if (!cocoa_inline_tab_bar_fix) cocoa_inline_tab_bar_fix = [[GLFWInlineTabBarFix alloc] init];
-    slot.postsFrameChangedNotifications = YES;
-    [[NSNotificationCenter defaultCenter] addObserver:cocoa_inline_tab_bar_fix
-                                             selector:@selector(slotFrameChanged:)
-                                                 name:NSViewFrameDidChangeNotification
-                                               object:slot];
-    objc_setAssociatedObject(slot, kInlineTabSlotWatch, @YES, OBJC_ASSOCIATION_RETAIN);
-}
-
-static void
-align_inline_tab_bar(NSWindow *nsw) {
-    if (!nsw || cocoa_aligning_inline_tabs) return;
-    if (nsw.tabGroup.windows.count < 2) return;
-    if ((nsw.styleMask & NSWindowStyleMaskFullSizeContentView) == 0) return;
-    NSView *theme = nsw.contentView.superview;
-    NSView *tab = find_tall_tab_bar(theme);
-    if (!tab) return;
-    Class slot_class = NSClassFromString(@"NSTitlebarAccessoryContainerView");
-    NSView *accessory_container = tab;
-    while (accessory_container && slot_class && ![accessory_container isKindOfClass:slot_class]) accessory_container = accessory_container.superview;
-    NSView *slot = accessory_container.superview;
-    cocoa_aligning_inline_tabs = true;
-    CGFloat title_h = current_titlebar_height(nsw);
-    if (title_h < 1) title_h = 32;
-    if (slot && slot.frame.size.height < title_h - 0.5) {
-        watch_inline_tab_slot(slot);
-        NSRect slot_frame = slot.frame;
-        slot_frame.size.height = title_h;
-        slot.frame = slot_frame;
-    } else if (slot) watch_inline_tab_slot(slot);
-    NSRect tab_win = [tab convertRect:tab.bounds toView:nil];
-    const CGFloat desired = NSMaxY(nsw.contentLayoutRect) + (title_h - tab_win.size.height) / 2.0;
-    const CGFloat shift = desired - tab_win.origin.y;
-    if (fabs(shift) > 0.5) {
-        NSRect tab_frame = tab.frame;
-        tab_frame.origin.y += shift;
-        tab.frame = tab_frame;
-    }
-    cocoa_aligning_inline_tabs = false;
-}
-
-static void
-install_inline_tab_container(_GLFWwindow *window) {
-    NSWindow *nsw = window->ns.object;
-    NSView *view = window->ns.view;
-    if (!view || nsw.contentView != view) return;
-    NSView *container = [[GLFWInlineTabContainerView alloc] initWithFrame:view.frame];
-    container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [view retain];
-    [nsw setContentView:container];
-    [container addSubview:view];
-    [view release];
-    [container release];
-}
-
-static void
-remove_inline_tab_container(_GLFWwindow *window) {
-    NSWindow *nsw = window->ns.object;
-    if (!window->ns.view || nsw.contentView == window->ns.view) return;
-    [window->ns.view retain];
-    [window->ns.view removeFromSuperview];
-    [nsw setContentView:window->ns.view];
-    [window->ns.view release];
-}
-
-static void
-sync_inline_titlebar_tabs(_GLFWwindow *window) {
-    if (!window || !window->ns.object || cocoa_inline_tab_sync_active) return;
-    cocoa_inline_tab_sync_active = true;
-    NSWindow *nsw = window->ns.object;
-    NSTitlebarAccessoryViewController *accessory = tab_bar_accessory(nsw);
-    const CGFloat seen_titlebar = current_titlebar_height(nsw);
-    if (seen_titlebar > 0.5 && fabs(seen_titlebar - 38.0) >= 0.5 && cocoa_system_titlebar_height < 0.5) cocoa_system_titlebar_height = seen_titlebar;
-    if (wants_inline_titlebar_tabs(window)) {
-        const CGFloat content_h = cocoa_have_preserved_content_height ? cocoa_preserved_content_height : NSHeight(nsw.contentLayoutRect);
-        const CGFloat top = NSMaxY(nsw.frame);
-        if (accessory) accessory.layoutAttribute = NSLayoutAttributeTop;
-        NSWindowStyleMask mask = nsw.styleMask | NSWindowStyleMaskFullSizeContentView;
-        if (nsw.styleMask != mask) [nsw setStyleMask:mask];
-        const CGFloat delta = content_h - NSHeight(nsw.contentLayoutRect);
-        if (fabs(delta) > 0.5) {
-            NSRect frame = nsw.frame;
-            frame.size.height += delta;
-            frame.origin.y = top - frame.size.height;
-            [nsw setFrame:frame display:YES];
-        }
-        install_inline_tab_container(window);
-        layout_inline_tab_content(window);
-        if (window->context.nsgl.object) [window->context.nsgl.object update];
-        _glfwInputWindowDamage(window);
-        align_inline_tab_bar(nsw);
-        NSWindow *align_window = nsw;
-        dispatch_async(dispatch_get_main_queue(), ^{
-          if (align_window) align_inline_tab_bar(align_window);
-        });
-    } else {
-        if (accessory && accessory.layoutAttribute == NSLayoutAttributeTop) accessory.layoutAttribute = NSLayoutAttributeBottom;
-        remove_inline_tab_container(window);
-        if (!window->ns.titlebar_hidden) {
-            NSWindowStyleMask mask = nsw.styleMask & ~NSWindowStyleMaskFullSizeContentView;
-            if (nsw.styleMask != mask) [nsw setStyleMask:mask];
-        }
-        if (cocoa_system_titlebar_height > 0.5 && fabs(current_titlebar_height(nsw) - 38.0) < 0.5) set_titlebar_height(nsw, cocoa_system_titlebar_height);
-    }
-    if (window->ns.view) [nsw makeFirstResponder:window->ns.view];
-    cocoa_inline_tab_sync_active = false;
+tab_eligible(_GLFWwindow *window) {
+    return window->ns.object && !window->ns.layer_shell.is_active && window->decorated && !window->ns.titlebar_hidden && !window->floating;
 }
 
 static NSRect
 get_window_size_without_border_in_logical_pixels(_GLFWwindow *window) {
-    NSWindow *nsw = window->ns.object;
     NSView *view = window->ns.view;
-    if (view && nsw.contentView != view) {
-        NSRect in_window = [view convertRect:view.bounds toView:nil];
-        return [nsw convertRectToScreen:in_window];
+    return [window->ns.object convertRectToScreen:[view convertRect:view.bounds toView:nil]];
+}
+
+// Measured from the live window because -frameRectForContentRect: is not documented to count titlebar accessories such as the tab bar.
+static NSRect
+frame_rect_for_content_rect(_GLFWwindow *window, NSRect content) {
+    const NSRect frame = [window->ns.object frame], cur = get_window_size_without_border_in_logical_pixels(window);
+    const CGFloat left = cur.origin.x - frame.origin.x, bottom = cur.origin.y - frame.origin.y;
+    const CGFloat right = NSMaxX(frame) - NSMaxX(cur), top = NSMaxY(frame) - NSMaxY(cur);
+    return NSMakeRect(content.origin.x - left, content.origin.y - bottom, content.size.width + left + right, content.size.height + bottom + top);
+}
+
+static void
+report_content_geometry(_GLFWwindow *window) {
+    const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
+    const NSRect fbRect = [window->ns.view convertRectToBacking:contentRect];
+    bool changed = false;
+    if (fbRect.size.width != window->ns.fbWidth || fbRect.size.height != window->ns.fbHeight) {
+        window->ns.fbWidth = (int)fbRect.size.width;
+        window->ns.fbHeight = (int)fbRect.size.height;
+        _glfwInputFramebufferSize(window, (int)fbRect.size.width, (int)fbRect.size.height);
+        changed = true;
     }
-    return [nsw contentRectForFrameRect:nsw.frame];
+    if (contentRect.size.width != window->ns.width || contentRect.size.height != window->ns.height) {
+        window->ns.width = (int)contentRect.size.width;
+        window->ns.height = (int)contentRect.size.height;
+        _glfwInputWindowSize(window, (int)contentRect.size.width, (int)contentRect.size.height);
+        changed = true;
+    }
+    if (changed && window->context.client != GLFW_NO_API) [window->context.nsgl.object update];
 }
 
 // Defines a constant for empty ranges in NSTextInputClient
@@ -916,28 +718,13 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
     if (_glfw.ns.disabledCursorWindow == window) _glfwCenterCursorInContentArea(window);
 
-    sync_inline_titlebar_tabs(window);
-
     const int maximized = [window->ns.object isZoomed];
     if (window->ns.maximized != maximized) {
         window->ns.maximized = maximized;
         _glfwInputWindowMaximize(window, maximized);
     }
 
-    const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
-    const NSRect fbRect = [window->ns.view convertRectToBacking:contentRect];
-
-    if (fbRect.size.width != window->ns.fbWidth || fbRect.size.height != window->ns.fbHeight) {
-        window->ns.fbWidth = (int)fbRect.size.width;
-        window->ns.fbHeight = (int)fbRect.size.height;
-        _glfwInputFramebufferSize(window, (int)fbRect.size.width, (int)fbRect.size.height);
-    }
-
-    if (contentRect.size.width != window->ns.width || contentRect.size.height != window->ns.height) {
-        window->ns.width = (int)contentRect.size.width;
-        window->ns.height = (int)contentRect.size.height;
-        _glfwInputWindowSize(window, (int)contentRect.size.width, (int)contentRect.size.height);
-    }
+    report_content_geometry(window);
     // Because of a bug in macOS Tahoe we cannot redraw the window in response
     // to a resize event that was caused by a screen change as the OpenGL
     // context is not ready yet. See: https://github.com/kovidgoyal/datty/issues/8983
@@ -1163,6 +950,12 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 @implementation GLFWContentView
 
+// AppKit resizes the content view, not always the window, when the tab bar is shown or hidden.
+- (void)setFrameSize:(NSSize)newSize {
+    [super setFrameSize:newSize];
+    if (window && window->ns.object && window->ns.view == self) report_content_geometry(window);
+}
+
 - (instancetype)initWithGlfwWindow:(_GLFWwindow *)initWindow {
     self = [super init];
     if (self != nil) {
@@ -1362,14 +1155,9 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)viewDidChangeBackingProperties {
     if (!window) return;
+    report_content_geometry(window);
     const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
     const NSRect fbRect = [window->ns.view convertRectToBacking:contentRect];
-
-    if (fbRect.size.width != window->ns.fbWidth || fbRect.size.height != window->ns.fbHeight) {
-        window->ns.fbWidth = (int)fbRect.size.width;
-        window->ns.fbHeight = (int)fbRect.size.height;
-        _glfwInputFramebufferSize(window, (int)fbRect.size.width, (int)fbRect.size.height);
-    }
 
     const float xscale = fbRect.size.width / contentRect.size.width;
     const float yscale = fbRect.size.height / contentRect.size.height;
@@ -2746,8 +2534,7 @@ glfwCocoaAddWindowToTabGroup(GLFWwindow *parent_handle, GLFWwindow *child_handle
     _GLFWwindow *parent = (_GLFWwindow *)parent_handle;
     _GLFWwindow *child = (_GLFWwindow *)child_handle;
     if (!parent || !child || parent == child) return;
-    if (!parent->ns.object || !child->ns.object) return;
-    if (parent->ns.layer_shell.is_active || child->ns.layer_shell.is_active) return;
+    if (!tab_eligible(parent) || !tab_eligible(child)) return;
     NSWindow *parent_window = parent->ns.object;
     NSWindow *child_window = child->ns.object;
     parent_window.restorable = YES;
@@ -2757,13 +2544,8 @@ glfwCocoaAddWindowToTabGroup(GLFWwindow *parent_handle, GLFWwindow *child_handle
     parent_window.tabbingIdentifier = @"datty";
     child_window.tabbingIdentifier = @"datty";
     if (!NSEqualRects(child_window.frame, parent_window.frame)) [child_window setFrame:parent_window.frame display:NO];
-    cocoa_preserved_content_height = NSHeight(parent_window.contentLayoutRect);
-    cocoa_have_preserved_content_height = cocoa_preserved_content_height > 0.5;
     [parent_window.tabGroup addWindow:child_window];
     parent_window.tabGroup.selectedWindow = child_window;
-    sync_inline_titlebar_tabs(parent);
-    sync_inline_titlebar_tabs(child);
-    cocoa_have_preserved_content_height = false;
     [child_window makeKeyAndOrderFront:nil];
     if (child->ns.view) [child_window makeFirstResponder:child->ns.view];
 }
@@ -3401,7 +3183,7 @@ void
 _glfwPlatformSetWindowPos(_GLFWwindow *window, int x, int y) {
     const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
     const NSRect dummyRect = NSMakeRect(x, _glfwTransformYNS(y + contentRect.size.height - 1), 0, 0);
-    const NSRect frameRect = [window->ns.object frameRectForContentRect:dummyRect];
+    const NSRect frameRect = frame_rect_for_content_rect(window, dummyRect);
     [window->ns.object setFrameOrigin:frameRect.origin];
 }
 
@@ -3421,21 +3203,10 @@ _glfwPlatformSetWindowSize(_GLFWwindow *window, int width, int height) {
     } else {
         // Disable window resizing in fullscreen.
         if ([window->ns.object styleMask] & NSWindowStyleMaskFullScreen || window->ns.in_traditional_fullscreen) return;
-        NSWindow *nsw = window->ns.object;
-        if (window->ns.view && nsw.contentView != (NSView *)window->ns.view) {
-            const CGFloat overlap = nsw.frame.size.height - nsw.contentLayoutRect.size.height;
-            NSRect frame = nsw.frame;
-            frame.origin.y += frame.size.height - (height + overlap);
-            frame.size.width = width;
-            frame.size.height = height + overlap;
-            [nsw setFrame:frame display:YES];
-            layout_inline_tab_content(window);
-            return;
-        }
         NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
         contentRect.origin.y += contentRect.size.height - height;
         contentRect.size = NSMakeSize(width, height);
-        [window->ns.object setFrame:[window->ns.object frameRectForContentRect:contentRect] display:YES];
+        [window->ns.object setFrame:frame_rect_for_content_rect(window, contentRect) display:YES];
     }
 }
 
@@ -3477,7 +3248,7 @@ _glfwPlatformGetFramebufferSize(_GLFWwindow *window, int *width, int *height) {
 void
 _glfwPlatformGetWindowFrameSize(_GLFWwindow *window, int *left, int *top, int *right, int *bottom) {
     const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
-    const NSRect frameRect = [window->ns.object frameRectForContentRect:contentRect];
+    const NSRect frameRect = frame_rect_for_content_rect(window, contentRect);
 
     if (left) *left = (int)(contentRect.origin.x - frameRect.origin.x);
     if (top) *top = (int)(frameRect.origin.y + frameRect.size.height - contentRect.origin.y - contentRect.size.height);
@@ -4652,7 +4423,7 @@ glfwCocoaSetWindowChrome(
         // https://github.com/kovidgoyal/datty/issues/6439
         if (is_transparent) has_shadow = false;
         bool hide_titlebar_buttons = !in_fullscreen && window->ns.titlebar_hidden;
-        const bool native_tabs = !window->ns.layer_shell.is_active && window->decorated && !window->ns.titlebar_hidden && !window->floating;
+        const bool native_tabs = tab_eligible(window);
         nsw.tabbingMode = native_tabs ? NSWindowTabbingModePreferred : NSWindowTabbingModeDisallowed;
         if (native_tabs) {
             nsw.tabbingIdentifier = @"datty";
@@ -4705,7 +4476,6 @@ glfwCocoaSetWindowChrome(
         if (desired_mask != current_style_mask) { [nsw setStyleMask:desired_mask]; }
 #undef tc
         apply_titlebar_color_settings(window);
-        sync_inline_titlebar_tabs(window);
 
         // HACK: Changing the style mask can cause the first responder to be cleared
         [nsw makeFirstResponder:window->ns.view];
