@@ -607,15 +607,6 @@ get_window_size_without_border_in_logical_pixels(_GLFWwindow *window) {
     return [window->ns.object convertRectToScreen:[view convertRect:view.bounds toView:nil]];
 }
 
-// Measured from the live window because -frameRectForContentRect: is not documented to count titlebar accessories such as the tab bar.
-static NSRect
-frame_rect_for_content_rect(_GLFWwindow *window, NSRect content) {
-    const NSRect frame = [window->ns.object frame], cur = get_window_size_without_border_in_logical_pixels(window);
-    const CGFloat left = cur.origin.x - frame.origin.x, bottom = cur.origin.y - frame.origin.y;
-    const CGFloat right = NSMaxX(frame) - NSMaxX(cur), top = NSMaxY(frame) - NSMaxY(cur);
-    return NSMakeRect(content.origin.x - left, content.origin.y - bottom, content.size.width + left + right, content.size.height + bottom + top);
-}
-
 static void
 report_content_geometry(_GLFWwindow *window) {
     const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
@@ -636,8 +627,6 @@ report_content_geometry(_GLFWwindow *window) {
     if (changed && window->context.client != GLFW_NO_API) [window->context.nsgl.object update];
 }
 
-// Defines a constant for empty ranges in NSTextInputClient
-//
 static const NSRange kEmptyRange = {NSNotFound, 0};
 
 
@@ -3183,7 +3172,7 @@ void
 _glfwPlatformSetWindowPos(_GLFWwindow *window, int x, int y) {
     const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
     const NSRect dummyRect = NSMakeRect(x, _glfwTransformYNS(y + contentRect.size.height - 1), 0, 0);
-    const NSRect frameRect = frame_rect_for_content_rect(window, dummyRect);
+    const NSRect frameRect = [window->ns.object frameRectForContentRect:dummyRect];
     [window->ns.object setFrameOrigin:frameRect.origin];
 }
 
@@ -3201,12 +3190,11 @@ _glfwPlatformSetWindowSize(_GLFWwindow *window, int width, int height) {
     if (window->monitor) {
         if (window->monitor->window == window) acquireMonitor(window);
     } else {
-        // Disable window resizing in fullscreen.
         if ([window->ns.object styleMask] & NSWindowStyleMaskFullScreen || window->ns.in_traditional_fullscreen) return;
         NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
         contentRect.origin.y += contentRect.size.height - height;
         contentRect.size = NSMakeSize(width, height);
-        [window->ns.object setFrame:frame_rect_for_content_rect(window, contentRect) display:YES];
+        [window->ns.object setFrame:[window->ns.object frameRectForContentRect:contentRect] display:YES];
     }
 }
 
@@ -3248,7 +3236,7 @@ _glfwPlatformGetFramebufferSize(_GLFWwindow *window, int *width, int *height) {
 void
 _glfwPlatformGetWindowFrameSize(_GLFWwindow *window, int *left, int *top, int *right, int *bottom) {
     const NSRect contentRect = get_window_size_without_border_in_logical_pixels(window);
-    const NSRect frameRect = frame_rect_for_content_rect(window, contentRect);
+    const NSRect frameRect = [window->ns.object frameRectForContentRect:contentRect];
 
     if (left) *left = (int)(contentRect.origin.x - frameRect.origin.x);
     if (top) *top = (int)(frameRect.origin.y + frameRect.size.height - contentRect.origin.y - contentRect.size.height);
@@ -4477,7 +4465,6 @@ glfwCocoaSetWindowChrome(
 #undef tc
         apply_titlebar_color_settings(window);
 
-        // HACK: Changing the style mask can cause the first responder to be cleared
         [nsw makeFirstResponder:window->ns.view];
         window->ns.notch_cover_color = color;
         window->ns.notch_cover_opacity = background_opacity;
