@@ -658,8 +658,6 @@ layout_inline_tab_content(_GLFWwindow *window) {
     }
 }
 
-// The GL view stays a subview so its frame can match contentLayoutRect.
-// The local key monitor delivers keyDown to contentView, not firstResponder.
 @interface GLFWInlineTabContainerView : NSView
 @end
 
@@ -726,8 +724,6 @@ watch_inline_tab_slot(NSView *slot) {
     objc_setAssociatedObject(slot, kInlineTabSlotWatch, @YES, OBJC_ASSOCIATION_RETAIN);
 }
 
-// The tab accessory's parent is left at height 0, so clicks never reach NSTabButton.
-// NSTabBar keeps its under-title origin and hugs the top of the 32pt bar.
 static void
 align_inline_tab_bar(NSWindow *nsw) {
     if (!nsw || cocoa_aligning_inline_tabs) return;
@@ -784,8 +780,6 @@ remove_inline_tab_container(_GLFWwindow *window) {
     [window->ns.view release];
 }
 
-// The system tab bar is a titlebar accessory under the title. Pinning it to
-// the top of a full-size content view puts the tabs on the traffic-light row.
 static void
 sync_inline_titlebar_tabs(_GLFWwindow *window) {
     if (!window || !window->ns.object || cocoa_inline_tab_sync_active) return;
@@ -795,8 +789,6 @@ sync_inline_titlebar_tabs(_GLFWwindow *window) {
     const CGFloat seen_titlebar = current_titlebar_height(nsw);
     if (seen_titlebar > 0.5 && fabs(seen_titlebar - 38.0) >= 0.5 && cocoa_system_titlebar_height < 0.5) cocoa_system_titlebar_height = seen_titlebar;
     if (wants_inline_titlebar_tabs(window)) {
-        // addWindow: shows the under-title tab bar first and shrinks contentLayoutRect.
-        // Preserve the pre-tab height, not that already-shrunk one.
         const CGFloat content_h = cocoa_have_preserved_content_height ? cocoa_preserved_content_height : NSHeight(nsw.contentLayoutRect);
         const CGFloat top = NSMaxY(nsw.frame);
         if (accessory) accessory.layoutAttribute = NSLayoutAttributeTop;
@@ -811,8 +803,6 @@ sync_inline_titlebar_tabs(_GLFWwindow *window) {
         }
         install_inline_tab_container(window);
         layout_inline_tab_content(window);
-        // The view is shrunk by the under-title tab bar before this restore.
-        // Without a context update the old surface stays pinned to the bottom.
         if (window->context.nsgl.object) [window->context.nsgl.object update];
         _glfwInputWindowDamage(window);
         align_inline_tab_bar(nsw);
@@ -827,7 +817,6 @@ sync_inline_titlebar_tabs(_GLFWwindow *window) {
             NSWindowStyleMask mask = nsw.styleMask & ~NSWindowStyleMaskFullSizeContentView;
             if (nsw.styleMask != mask) [nsw setStyleMask:mask];
         }
-        // 38 is the height a previous build forced with setTitlebarHeight:.
         if (cocoa_system_titlebar_height > 0.5 && fabs(current_titlebar_height(nsw) - 38.0) < 0.5) set_titlebar_height(nsw, cocoa_system_titlebar_height);
     }
     if (window->ns.view) [nsw makeFirstResponder:window->ns.view];
@@ -2749,7 +2738,6 @@ static void (*cocoa_new_tab_callback)(void);
 GLFWAPI void
 glfwCocoaSetNewTabCallback(void (*callback)(void)) {
     cocoa_new_tab_callback = callback;
-    // Join only from glfwCocoaAddWindowToTabGroup, after the new window matches the current frame.
     [NSWindow setAllowsAutomaticWindowTabbing:NO];
 }
 
@@ -2762,7 +2750,6 @@ glfwCocoaAddWindowToTabGroup(GLFWwindow *parent_handle, GLFWwindow *child_handle
     if (parent->ns.layer_shell.is_active || child->ns.layer_shell.is_active) return;
     NSWindow *parent_window = parent->ns.object;
     NSWindow *child_window = child->ns.object;
-    // AppKit ignores addTabbedWindow: on windows created with setRestorable:NO.
     parent_window.restorable = YES;
     child_window.restorable = YES;
     parent_window.tabbingMode = NSWindowTabbingModePreferred;
