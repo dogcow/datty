@@ -185,8 +185,8 @@ string_capabilities = {
     'initc': r'\E]4;%p1%d;rgb\:%p2%{255}%*%{1000}%/%2.2X/%p3%{255}%*%{1000}%/%2.2X/%p4%{255}%*%{1000}%/%2.2X\E\\',
     # Set all colors to original values
     'oc': r'\E]104\007',
-    # turn on blank mode (characters invisible)
-    # 'invis': r'\E[8m',
+    # turn on blank mode (characters invisible). SGR 28 and SGR 0 turn it off.
+    'invis': r'\E[8m',
     # Backspace
     'kbs': r'\177',
     # Mouse event has occurred
@@ -403,7 +403,7 @@ termcap_aliases.update(
         'SF': 'indn',
         'Ic': 'initc',
         'oc': 'oc',
-        # 'mk': 'invis',
+        'mk': 'invis',
         'kb': 'kbs',
         'kl': 'kcub1',
         'kd': 'kcud1',

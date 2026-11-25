@@ -999,6 +999,7 @@ PyInit_fast_data_types(void) {
     s(DIM, dim);
     s(DECORATION, decoration);
     s(BLINK, blink);
+    s(CONCEAL, conceal);
 #undef s
     PyModule_AddIntConstant(m, "MARK_MASK", MARK_MASK);
     PyModule_AddIntConstant(m, "NUM_INDEXED_IMAGE_SPECIAL_COLORS", NUM_INDEXED_IMAGE_SPECIAL_COLORS);

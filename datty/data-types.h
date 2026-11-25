@@ -263,7 +263,7 @@ typedef struct {
     CursorShape shape;
 
     struct {
-        bool bold, italic, reverse, strikethrough, dim, blink;
+        bool bold, italic, reverse, strikethrough, dim, blink, conceal;
         uint8_t decoration;
         color_type fg, bg, decoration_fg;
     } sgr;

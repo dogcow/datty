@@ -1005,6 +1005,7 @@ cell_as_sgr(const GPUCell *cell, const GPUCell *prev) {
     if (CA.reverse != PA.reverse) P(CA.reverse ? "7;" : "27;");
     if (CA.strike != PA.strike) P(CA.strike ? "9;" : "29;");
     if (CA.blink != PA.blink) P(CA.blink ? "5;" : "25;");
+    if (CA.conceal != PA.conceal) P(CA.conceal ? "8;" : "28;");
     if (cell->fg != prev->fg) p += color_as_sgr(p, SZ, cell->fg, 30, 90, 38);
     if (cell->bg != prev->bg) p += color_as_sgr(p, SZ, cell->bg, 40, 100, 48);
     if (cell->decoration_fg != prev->decoration_fg) p += color_as_sgr(p, SZ, cell->decoration_fg, 0, 0, DECORATION_FG_CODE);

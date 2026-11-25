@@ -36,7 +36,7 @@ static PyObject *
 repr(Cursor *self) {
     return PyUnicode_FromFormat(
         "Cursor(x=%u, y=%u, shape=%s, blink=%R, fg=#%08x, bg=#%08x, bold=%R, italic=%R, reverse=%R, strikethrough=%R, dim=%R, decoration=%d, "
-        "decoration_fg=#%08x, text_blink=%R)",
+        "decoration_fg=#%08x, text_blink=%R, conceal=%R)",
         self->x,
         self->y,
         (self->shape < NUM_OF_CURSOR_SHAPES ? cursor_names[self->shape] : "INVALID"),
@@ -50,7 +50,8 @@ repr(Cursor *self) {
         BOOL(self->sgr.dim),
         self->sgr.decoration,
         self->sgr.decoration_fg,
-        BOOL(self->sgr.blink));
+        BOOL(self->sgr.blink),
+        BOOL(self->sgr.conceal));
 }
 
 void
@@ -111,6 +112,7 @@ cursor_from_sgr(Cursor *self, int *params, unsigned int count, bool is_group) {
                 break;
             case 5: self->sgr.blink = true; break;
             case 7: self->sgr.reverse = true; break;
+            case 8: self->sgr.conceal = true; break;
             case 9: self->sgr.strikethrough = true; break;
             case 21: self->sgr.decoration = 2; break;
             case 221: self->sgr.bold = false; break;
@@ -123,6 +125,7 @@ cursor_from_sgr(Cursor *self, int *params, unsigned int count, bool is_group) {
             case 24: self->sgr.decoration = 0; break;
             case 25: self->sgr.blink = false; break;
             case 27: self->sgr.reverse = false; break;
+            case 28: self->sgr.conceal = false; break;
             case 29: self->sgr.strikethrough = false; break;
             case 30 ... 37: self->sgr.fg = ((attr - 30) << 8) | 1; break;
             case 38: SET_COLOR(sgr.fg);
@@ -191,6 +194,7 @@ apply_sgr_to_cells(GPUCell *first_cell, unsigned int cell_count, int *params, un
             }
             case 5: S(blink, true);
             case 7: S(reverse, true);
+            case 8: S(conceal, true);
             case 9: S(strike, true);
             case 21: S(decoration, 2);
             case 221: S(bold, false);
@@ -205,6 +209,7 @@ apply_sgr_to_cells(GPUCell *first_cell, unsigned int cell_count, int *params, un
             case 24: S(decoration, 0);
             case 25: S(blink, false);
             case 27: S(reverse, false);
+            case 28: S(conceal, false);
             case 29: S(strike, false); START_ALLOW_CASE_RANGE
             case 30 ... 37: SIMPLE(fg, ((attr - 30) << 8) | 1);
             case 38: SET_COLOR(fg);
@@ -288,6 +293,7 @@ SGR_BOOL_GETSET(italic)
 SGR_BOOL_GETSET(reverse)
 SGR_BOOL_GETSET(strikethrough)
 SGR_BOOL_GETSET(dim)
+SGR_BOOL_GETSET(conceal)
 #undef SGR_BOOL_GETSET
 
 static PyObject *
@@ -353,7 +359,8 @@ static PyMemberDef members[] = {
 };
 
 static PyGetSetDef getseters[] = {
-    GETSET(bold) GETSET(italic) GETSET(reverse) GETSET(strikethrough) GETSET(dim) GETSET(blink) GETSET(text_blink) GETSET(decoration) GETSET(fg) GETSET(bg)
+    GETSET(bold) GETSET(italic) GETSET(reverse) GETSET(strikethrough) GETSET(dim) GETSET(blink) GETSET(text_blink) GETSET(conceal) GETSET(decoration)
+        GETSET(fg) GETSET(bg)
         GETSET(decoration_fg){NULL} /* Sentinel */
 };
 

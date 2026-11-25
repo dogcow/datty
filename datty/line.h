@@ -19,8 +19,9 @@ typedef union CellAttrs {
         uint16_t dim : 1;
         uint16_t blink : 1;
         uint16_t mark : 2;
+        uint16_t conceal : 1;
         // named so that initializers zero it, see CPUCell
-        uint32_t padding : 21;
+        uint32_t padding : 20;
     };
     uint32_t val;
 } CellAttrs;
@@ -239,7 +240,8 @@ cursor_to_attrs(const Cursor *c) {
         .reverse = c->sgr.reverse,
         .strike = c->sgr.strikethrough,
         .dim = c->sgr.dim,
-        .blink = c->sgr.blink};
+        .blink = c->sgr.blink,
+        .conceal = c->sgr.conceal};
     return ans;
 }
 
@@ -252,6 +254,7 @@ attrs_to_cursor(const CellAttrs attrs, Cursor *c) {
     c->sgr.strikethrough = attrs.strike;
     c->sgr.dim = attrs.dim;
     c->sgr.blink = attrs.blink;
+    c->sgr.conceal = attrs.conceal;
 }
 
 #define cursor_as_gpu_cell(cursor)      \
