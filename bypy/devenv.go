@@ -361,7 +361,7 @@ func dependencies(args []string) {
 		exit(err)
 	}
 
-	fmt.Println(`Dependencies downloaded. Now build kitty with: ./dev.sh build`)
+	fmt.Println(`Dependencies downloaded. Now build datty with: ./dev.sh build`)
 }
 
 // }}}
@@ -415,7 +415,7 @@ func build(args []string) {
 		fmt.Fprintln(os.Stderr, "The following build command failed:", python, strings.Join(args, " "))
 		exit(err)
 	}
-	fmt.Println("Build successful. Run kitty as: kitty/launcher/kitty")
+	fmt.Println("Build successful. Run datty as: datty/launcher/datty")
 }
 
 func docs(args []string) {
