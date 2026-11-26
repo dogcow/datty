@@ -7,11 +7,11 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from functools import partial
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from datty.cli import parse_args
 from datty.cli_stub import PanelCLIOptions
-from datty.constants import is_macos, daddy_exe
+from datty.constants import is_macos
 from datty.fast_data_types import (
     GLFW_EDGE_BOTTOM,
     GLFW_EDGE_CENTER,
@@ -28,6 +28,7 @@ from datty.fast_data_types import (
     GLFW_LAYER_SHELL_PANEL,
     GLFW_LAYER_SHELL_TOP,
     current_focused_os_window_id,
+    get_options,
     layer_shell_config_for_os_window,
     set_layer_shell_config,
     toggle_os_window_visibility,
@@ -35,7 +36,10 @@ from datty.fast_data_types import (
 from datty.simple_cli_definitions import panel_options_spec
 from datty.types import LayerShellConfig, run_once
 from datty.typing_compat import BossType
-from datty.utils import log_error
+from datty.utils import log_error, resolved_shell
+
+if TYPE_CHECKING:
+    from datty.tabs import SpecialWindowInstance
 
 args = PanelCLIOptions()
 help_text = 'Use a command line program to draw a GPU accelerated panel on your desktop'
@@ -163,16 +167,26 @@ def have_config_files_been_updated(config_files: Iterable[str]) -> bool:
     return ans
 
 
-def run_in_existing_panel(boss: BossType, cmd: list[str], environ: Mapping[str, str], cwd: str) -> None:
+def window_for_command(cmd: list[str], environ: Mapping[str, str], launch_type: str, cwd: str = '') -> 'SpecialWindowInstance':
+    # The command is requested by the user via a separate invocation of the
+    # panel daddy, so it is passed to the launch wrapper, without a source
+    # window, since it is not run from any window in this datty instance. The
+    # environment and working directory are those of the invocation, with the
+    # environment cleaned up as for other single instance commands.
+    from datty.child import process_env
+    from datty.launch_wrapper import LaunchRequest
     from datty.tabs import SpecialWindow
 
+    return SpecialWindow(cmd=cmd, env=process_env(environ), cwd=cwd or None, hold=args.hold, launch_request=LaunchRequest(launch_type))
+
+
+def run_in_existing_panel(boss: BossType, cmd: list[str], environ: Mapping[str, str], cwd: str) -> None:
     tm = boss.os_window_map.get(current_focused_os_window_id()) or next(iter(boss.os_window_map.values()))
-    sw = SpecialWindow(cmd=cmd, env=dict(environ), cwd=cwd or None, hold=args.hold)
     tab = tm.active_tab
     if args.if_running == 'new-window' and tab is not None:
-        tab.new_special_window(sw)
+        tab.new_special_window(window_for_command(cmd, environ, 'window', cwd))
     else:
-        tm.new_tab(sw)
+        tm.new_tab(window_for_command(cmd, environ, 'tab', cwd))
     boss.focus_os_window(tm.os_window_id)
 
 
@@ -181,7 +195,6 @@ def handle_single_instance_command(
 ) -> None:
     global args
     from datty.cli import parse_override
-    from datty.tabs import SpecialWindow
 
     try:
         new_args, items = parse_panel_args(list(sys_args[1:]))
@@ -207,12 +220,14 @@ def handle_single_instance_command(
         if run_in_existing:
             run_in_existing_panel(boss, items, environ, cwd)
         return
-    items = items or [daddy_exe(), 'run-shell']
     os_window_id = boss.add_os_panel(lsc, args.cls, args.name)
     if notify_on_os_window_death:
         boss.os_window_death_actions[os_window_id] = partial(boss.notify_on_os_window_death, notify_on_os_window_death)
     tm = boss.os_window_map[os_window_id]
-    tm.new_tab(SpecialWindow(cmd=items, env=dict(environ), hold=args.hold))
+    # Without a command run the shell, as a panel started without single
+    # instance does. Not datty's run-shell daddy, so that the launch wrapper
+    # sees the actual shell.
+    tm.new_tab(window_for_command(items or resolved_shell(get_options()), environ, 'os-window', cwd))
 
 
 def main(sys_args: list[str]) -> None:

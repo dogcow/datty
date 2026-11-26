@@ -25,6 +25,8 @@ definition.add_deprecation('deprecated_macos_show_window_title_in_menubar_alias'
 definition.add_deprecation('deprecated_send_text', 'send_text')
 definition.add_deprecation('deprecated_adjust_line_height', 'adjust_line_height', 'adjust_column_width', 'adjust_baseline')
 definition.add_deprecation('deprecated_scrollback_indicator_opacity', 'scrollback_indicator_opacity')
+definition.add_deprecation('deprecated_input_delay', 'input_delay')
+definition.add_deprecation('deprecated_render_options', 'sync_to_monitor', 'repaint_delay')
 
 agr = definition.add_group
 egr = definition.end_group
@@ -69,7 +71,8 @@ opt(
     option_type='to_bool',
     ctype='bool',
     long_text="""
-datty does not support BIDI (bidirectional text), however, for RTL scripts,
+By default datty lays out BIDI (bidirectional text) only when a program asks it
+to, see :ref:`bidi_support`. Otherwise, for RTL scripts,
 words are automatically displayed in RTL. That is to say, in an RTL script, the
 words "HELLO WORLD" display in datty as "WORLD HELLO", and if you try to select
 a substring of an RTL-shaped string, you will get the character that would be
@@ -82,7 +85,7 @@ option is provided to turn it off. Furthermore, this option can be used with the
 command line program :link:`GNU FriBidi
 <https://github.com/fribidi/fribidi#executable>` to get BIDI support, because it
 will force datty to always treat the text as LTR, which FriBidi expects for
-terminals.
+terminals. It also turns off the layout that programs can ask datty for.
 """,
 )
 
@@ -431,8 +434,8 @@ opt(
     ctype='!cursor_blink_interval',
     long_text="""
 The interval to blink the cursor (in seconds). Set to zero to disable blinking.
-Negative values mean use system default. Note that the minimum interval will be
-limited to :opt:`repaint_delay`. You can also animate the cursor blink by specifying
+Negative values mean use system default. Note that how often the screen is actually
+redrawn is controlled by :opt:`render_interval`. You can also animate the cursor blink by specifying
 an :term:`easing function`. For example, setting this to option to :code:`0.5 ease-in-out`
 will cause the cursor blink to be animated over a second, in the first half of the second
 it will go from opaque to transparent and then back again over the next half. You can specify
@@ -511,6 +514,16 @@ number of cells the cursor must move in each dimension before the trail is
 started. When the cursor moves less than the threshold in both dimensions,
 the trail is skipped, reducing unnecessary cursor trail animation. The
 threshold does not apply when the cursor moves to a different window.
+
+Add the word :code:`prompt` at the end, for example,
+:code:`cursor_trail_start_threshold 2 prompt`, to show the trail only for
+cursor movement at the shell prompt. Then, when :ref:`shell_integration` is
+active, there is no trail for cursor movement in the output of commands or for
+the jump to the next prompt after a command finishes. Note that this means no
+trail for programs that run in the main screen without shell integration of
+their own, such as REPLs or :program:`ssh` to a computer without shell
+integration. Full screen programs such as editors and moving to a different
+window are not affected.
 """,
 )
 
@@ -728,6 +741,10 @@ as the scrollbar .
     a horizontal progress bar on the bottom edge
 :code:`hidden`
     dont show the progress bar
+
+To draw progress bars with a shader instead, use :opt:`custom_shaders`, for example:
+:code:`custom_shaders progress-bar`. Custom shaders that react to progress replace
+the builtin progress bar regardless of this setting.
 """,
 )
 
@@ -1525,48 +1542,80 @@ egr()  # }}}
 agr('performance', 'Performance tuning')
 
 opt(
-    'repaint_delay',
-    '10',
-    option_type='positive_int',
-    ctype='time-ms',
+    'render_interval',
+    'monitor',
+    option_type='render_interval',
+    ctype='!render_interval',
     long_text="""
-Delay between screen updates (in milliseconds). Decreasing it, increases
-frames-per-second (FPS) at the cost of more CPU usage. The default value yields
-~100 FPS which is more than sufficient for most uses. Note that to actually
-achieve 100 FPS, you have to either set :opt:`sync_to_monitor` to :code:`no` or
-use a monitor with a high refresh rate. Also, to minimize latency when there is
-pending input to be processed, this option is ignored.
+Controls how often datty redraws the screen. datty only ever redraws when
+something has changed, this option controls the pacing of redraws when
+the screen is changing rapidly, for example, when scrolling or when a lot of
+output is being printed.
+
+The default value of :code:`monitor` syncs redraws to the refresh rate of the
+monitor the window is on. Redraws happen at most once per refresh of the
+monitor, as signalled by the windowing system, which prevents
+:link:`screen tearing <https://en.wikipedia.org/wiki/Screen_tearing>` and
+wasted work. On X11, this requires the X server to support the Present
+extension, without it, datty falls back to syncing using buffer swaps, which
+block, and redraws at most 100 times a second.
+
+You can additionally specify a minimum interval between frames in milliseconds,
+for example, :code:`monitor 16` will sync to the monitor but never redraw more
+than about 60 times a second, even on monitors with a higher refresh rate. Use
+this to reduce energy usage on high refresh rate monitors.
+
+Alternately, you can specify just a number which is the minimum interval
+between redraws in milliseconds, for example, :code:`8` for at most ~120 redraws
+per second. In this mode datty does not sync to the monitor, it redraws as soon as
+something changes, as long as at least the specified interval has elapsed since
+the previous redraw. This can slightly reduce latency at the cost of more
+energy usage and, on X11 without a compositor, screen tearing. On Wayland, the
+compositor never displays more frames than the monitor refresh rate, so extra
+frames are wasted work, the only benefit is slightly lower latency.
+
+In both modes, datty stops redrawing windows that the windowing system reports
+as hidden. On Wayland, when not syncing to the monitor, datty stops redrawing
+a quarter of a second after the compositor stops sending it frame events.
+
+The first redraw after a period of no changes always happens immediately in
+both modes, so the interval does not add latency to typing.
+
+This option replaces the removed options :code:`sync_to_monitor` and
+:code:`repaint_delay`. If they are present in your config and this option is
+not, they are converted to an equivalent value of this option:
+:code:`sync_to_monitor no` becomes the value of :code:`repaint_delay` (default 10)
+and :code:`repaint_delay N` with :code:`sync_to_monitor yes` becomes :code:`monitor N`.
+If this option is present anywhere in your config, including in included files
+and command line overrides, the removed options are ignored, with a warning.
 """,
 )
 
 opt(
-    'input_delay',
-    '3',
-    option_type='positive_int',
-    ctype='time-ms',
+    'gpu_driver',
+    'metal vulkan opengl software',
+    option_type='gpu_driver',
     long_text="""
-Delay before input from the program running in the terminal is processed (in
-milliseconds). Note that decreasing it will increase responsiveness, but also
-increase CPU usage and might cause flicker in full screen programs that redraw
-the entire screen on each loop, because datty is so fast that partial screen
-updates will be drawn. This setting is ignored when the input buffer is almost
-full. It is also ignored when less than 1 KB of input is pending, such as when
-the program echoes typed characters, but at most once per delay period, so
-continuous streams of small writes are still coalesced.
-""",
-)
+The GPU drivers datty uses to render, as a space or comma separated list, in
+order of preference. datty uses the first driver in the list that works on your
+system, skipping drivers that are not available on your platform or were not
+included in the build of datty. The available drivers are: :code:`metal`
+(macOS), :code:`vulkan` (Linux and BSD) and :code:`opengl` (all platforms).
 
-opt(
-    'sync_to_monitor',
-    'yes',
-    option_type='to_bool',
-    ctype='bool',
-    long_text="""
-Sync screen updates to the refresh rate of the monitor. This prevents
-:link:`screen tearing <https://en.wikipedia.org/wiki/Screen_tearing>` when
-scrolling. However, it limits the rendering speed to the refresh rate of your
-monitor. With a very high speed mouse/high keyboard repeat rate, you may notice
-some slight input latency. If so, set this to :code:`no`.
+The special value :code:`software` renders on the CPU, without a GPU, using
+the software renderers of the Mesa graphics library, lavapipe for Vulkan and
+llvmpipe for OpenGL, which must be installed. This is useful in virtual
+machines and on systems without a GPU or with broken GPU drivers, but is
+slow. It is available only on Linux and BSD. The other drivers skip
+software renderers, so that a working GPU is always preferred, unless they
+are last in the list. Remove :code:`software` from the list to never use
+software rendering, or put it first to always use it. When software rendering
+is used, datty shows a message saying so for a few seconds in every new OS
+window.
+
+Use :option:`datty --debug-rendering` to see which driver is used and why
+others were rejected. Changing this option by reloading the config is not
+supported.
 """,
 )
 egr()  # }}}
@@ -1635,6 +1684,8 @@ Some text or a Unicode symbol to show on the tab if a window in the tab that
 does not have focus has a bell. If you want to use leading or trailing
 spaces, surround the text with quotes. See :opt:`tab_title_template` for how
 this is rendered.
+The bell indicator is cleared when the window is focused or by
+the :ac:`clear_bell_indicators` action.
 
 For backwards compatibility, values of :code:`yes`, :code:`y` and :code:`true`
 are converted to the default bell symbol and :code:`no`, :code:`n`,
@@ -1848,10 +1899,11 @@ opt(
     option_type='optional_edge_width',
     long_text="""
 The window margin to use when only a single window is visible (in pts). Negative
-values will cause the value of :opt:`window_margin_width` to be used instead. A
-single value sets all four sides. Two values set the vertical and horizontal
-sides. Three values set top, horizontal and bottom. Four values set top, right,
-bottom and left.
+values will cause the value of :opt:`window_margin_width` to be used instead.
+A tab that has docks, including the docks of its OS window, never counts as
+showing a single window, see :ref:`docks`. A single value sets all four sides.
+Two values set the vertical and horizontal sides. Three values set top,
+horizontal and bottom. Four values set top, right, bottom and left.
 """,
 )
 
@@ -1887,10 +1939,11 @@ opt(
     option_type='optional_edge_width',
     long_text="""
 The window padding to use when only a single window is visible (in pts). Negative
-values will cause the value of :opt:`window_padding_width` to be used instead. A
-single value sets all four sides. Two values set the vertical and horizontal
-sides. Three values set top, horizontal and bottom. Four values set top, right,
-bottom and left.
+values will cause the value of :opt:`window_padding_width` to be used instead.
+A tab that has docks, including the docks of its OS window, never counts as
+showing a single window, see :ref:`docks`. A single value sets all four sides.
+Two values set the vertical and horizontal sides. Three values set top,
+horizontal and bottom. Four values set top, right, bottom and left.
 """,
 )
 
@@ -2158,7 +2211,12 @@ opt(
 A template to render the window title bar text. Uses the same template syntax as
 :opt:`tab_title_template`. Available variables include: :code:`{title}`,
 :code:`{bell_symbol}`, :code:`{activity_symbol}`, :code:`{progress_percent}`,
-:code:`{custom}`, :code:`{fmt}`, :code:`{is_active}`.
+:code:`{custom}`, :code:`{fmt}`, :code:`{is_active}` and :code:`{window}`, which is the window id and has
+the fields :code:`{window.id}`, :code:`{window.wd}` (working directory of the foreground process
+on the local machine), :code:`{window.columns}` and :code:`{window.lines}`. Note that, as with
+the tab bar, the title bar is only redrawn when something changes, such as the window title or
+the working directory being reported by :ref:`shell_integration`, so :code:`{window.wd}` does not
+follow a change of directory that is not accompanied by one of these.
 You can also provide a custom :code:`draw_window_title(data)` function in
 :file:`window_title_bar.py` in the datty config directory, exposed as :code:`{custom}`.
 """,
@@ -2926,6 +2984,8 @@ whatever shell is set as the default shell for the current user. Note that on
 macOS if you change this, you might need to add :code:`--login` and
 :code:`--interactive` to ensure that the shell starts in interactive mode and
 reads its startup rc files. Environment variables are expanded in this setting.
+To run every program in new windows, not just the shell, via a wrapper, such as
+inside a container, see :ref:`launch_wrapper`.
 """,
 )
 

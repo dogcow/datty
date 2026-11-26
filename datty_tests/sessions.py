@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2026, Kovid Goyal <kovid at kovidgoyal.net>
 
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 from datty.fast_data_types import Screen
@@ -149,6 +150,214 @@ class TestSessions(BaseTest):
                     assert_error('None of the matching windows')
         boss.edit_file.assert_not_called()
 
+    def test_save_as_session_preserves_literal_dollars(self) -> None:
+        from functools import partial
+
+        from datty.boss import Boss
+        from datty.child import Child
+        from datty.launch import LaunchSpec, get_env
+        from datty.session import default_save_as_session_opts, save_as_session_part2
+        from datty.tabs import Tab, TabManager
+        from datty.utils import resolve_custom_file
+        from datty.window import EdgeWidths, Window, WindowCreationSpec
+
+        opts = self.set_options()
+        literal = 'literal $DATTY_SESSION_TEST ${DATTY_SESSION_TEST} $$'
+        cmd = ['/bin/true', literal]
+        # Watchers are stored as specified by the user, so $$ is a literal $
+        watcher = '/watchers/w $$DATTY_SESSION_TEST.py'
+        creation_spec = WindowCreationSpec(cmd=cmd, env=(('SESSION_VALUE', literal),), watchers=(watcher,))
+        save_opts = default_save_as_session_opts()
+        save_opts.save_only = True
+
+        class Group(list[SimpleNamespace]):
+            docks = ()
+
+            def __init__(self, window: SimpleNamespace) -> None:
+                super().__init__([window])
+                self.id = window.id
+
+        def make_group(wid: int, path: Path) -> Group:
+            w = SimpleNamespace(
+                id=wid,
+                os_window_id=0,
+                tab_id=0,
+                cwd_for_serialization=str(path),
+                last_focused_at=0,
+                creation_spec=creation_spec,
+                actions_on_close=(),
+                actions_on_focus_change=(),
+                actions_on_removal=(),
+                allow_remote_control=False,
+                remote_control_passwords=None,
+                user_vars={'name': literal},
+                override_title=literal,
+                padding=EdgeWidths(),
+                margin=EdgeWidths(),
+            )
+            w.as_launch_command = partial(Window.as_launch_command, cast(Window, w))
+            return Group(w)
+
+        with TemporaryDirectory() as tmp, patch.dict('os.environ', DATTY_SESSION_TEST='expanded'):
+            base = Path(tmp).resolve()
+            original = base / 'original'
+            names = ('common ' + literal, 'override ' + literal, 'current', '~root')
+            for name in names:
+                (original / name).mkdir(parents=True)
+            groups = [make_group(i, original / name) for i, name in enumerate(names, 1)]
+            tab = SimpleNamespace(
+                windows=SimpleNamespace(active_group=groups[0], groups=groups, tab_docks=(), dock_owner=lambda g: None),
+                enabled_layouts=['tall'],
+                _current_layout_name='tall',
+                name=literal,
+                serialize_layout_state_for_session=dict,
+            )
+            tab.serialize_state_as_session = partial(Tab.serialize_state_as_session, cast(Tab, tab))
+            tm = SimpleNamespace(tabs=[tab], active_tab=tab, wm_class=literal, wm_name=literal, os_window_docks=())
+            tm.serialize_state_as_session = partial(TabManager.serialize_state_as_session, cast(TabManager, tm))
+            boss = SimpleNamespace(os_window_map={1: tm})
+            boss.serialize_state_as_session = partial(Boss.serialize_state_as_session, cast(Boss, boss))
+            logo_path = str(base / (literal + '.png'))
+            filename = 'test.datty-session'
+            for relocatable in (False, True):
+                with self.subTest(relocatable=relocatable):
+                    save_opts.relocatable = relocatable
+                    with patch('datty.window.get_window_logo_settings_if_not_default', return_value=(logo_path, 1.0, (0.5,) * 4)):
+                        save_as_session_part2(boss, save_opts, str(original / filename))
+                    root = original
+                    if relocatable:
+                        root = original.rename(base / ('relocated ' + literal))
+                    path = root / filename
+                    (session,) = parse_session(path.read_text(), opts, session_path=str(path))
+                    (saved_tab,) = session.tabs
+                    self.ae((saved_tab.name, session.os_window_class, session.os_window_name), (literal, literal, literal))
+                    self.ae(len(saved_tab.windows), len(names))
+                    self.ae(saved_tab.cwd, str(root / names[0]))
+                    for window, name in zip(saved_tab.windows, names):
+                        spec = window.launch_spec
+                        assert isinstance(spec, LaunchSpec)
+                        self.ae(spec.args, cmd)
+                        self.ae(spec.opts.window_title, literal)
+                        self.ae(spec.opts.var, ['name=' + literal])
+                        self.ae(resolve_custom_file(spec.opts.logo), logo_path)
+                        self.ae([resolve_custom_file(x) for x in spec.opts.watcher], ['/watchers/w $DATTY_SESSION_TEST.py'])
+                        # Tab._startup() launches session windows without expanding the cwd again
+                        child = Child(spec.args, spec.opts.cwd, env=get_env(spec.opts), expand_cwd=False)
+                        self.ae((child.cwd, child.env['SESSION_VALUE']), (str(root / name), literal))
+
+    def test_session_cwd_resolution(self) -> None:
+        from datty.child import Child
+        from datty.launch import LaunchSpec
+
+        opts = self.set_options()
+        with TemporaryDirectory() as tmp, patch.dict('os.environ', DATTY_SESSION_TEST='expanded'):
+            base = Path(tmp).resolve()
+            path = base / 'test.datty-session'
+            text = (
+                'cd tab$$DATTY_SESSION_TEST\nlaunch\nlaunch --cwd=win$DATTY_SESSION_TEST\nlaunch --cwd=~\nlaunch --cwd=current\n'
+                'launch --cwd=/abs$$DATTY_SESSION_TEST\n'
+            )
+            (session,) = parse_session(text, opts, session_path=str(path))
+            (tab,) = session.tabs
+            self.ae(tab.cwd, str(base / 'tab$DATTY_SESSION_TEST'))
+            cwds = []
+            for w in tab.windows:
+                assert isinstance(w.launch_spec, LaunchSpec)
+                cwds.append(w.launch_spec.opts.cwd)
+            self.ae(cwds, [tab.cwd, str(base / 'winexpanded'), os.path.expanduser('~'), 'current', '/abs$DATTY_SESSION_TEST'])
+            # Other callers still get their cwd expanded by Child
+            self.ae(Child(['/bin/true'], str(base / '$DATTY_SESSION_TEST')).cwd, str(base / 'expanded'))
+            self.ae(Child(['/bin/true'], str(base / '$DATTY_SESSION_TEST'), expand_cwd=False).cwd, str(base / '$DATTY_SESSION_TEST'))
+
+    def test_session_cwd_is_not_expanded_again(self) -> None:
+        from datty.launch import launch, parse_launch_args
+        from datty.session import Tab as SessionTab
+        from datty.session import WindowSpec
+        from datty.tabs import Tab
+
+        self.set_options()
+        # Tab._startup() launches session windows without expanding the cwd
+        session_tab = SimpleNamespace(windows=[WindowSpec(parse_launch_args([]))], active_window_idx=0, layout_state=None)
+        stub = SimpleNamespace(created_in_session_name='')
+        with patch('datty.tabs.get_boss'), patch('datty.launch.launch', return_value=None) as launch_mock:
+            Tab._startup(cast(Tab, stub), cast(SessionTab, session_tab))
+        self.ae(launch_mock.call_args.kwargs['expand_cwd'], False)
+        # launch() passes it on
+        boss = SimpleNamespace(active_window=None)
+        with patch('datty.launch._launch', return_value=None) as _launch_mock:
+            launch(cast(Any, boss), cast(Any, SimpleNamespace(keep_focus=False)), [], expand_cwd=False)
+        self.ae(_launch_mock.call_args.args[-1], False)
+
+        # Tab.launch_child() decides whether Child expands the cwd
+        def child_kwargs(tab_cwd_is_expanded: bool, **kw: Any) -> tuple[str, bool]:
+            stub = SimpleNamespace(cwd='/tab$X', cwd_is_expanded=tab_cwd_is_expanded, os_window_id=0, args=SimpleNamespace(args=()))
+            with patch('datty.tabs.Child') as child_mock, patch('datty.tabs.platform_window_id', return_value=None):
+                Tab.launch_child(cast(Tab, stub), cmd=kw.pop('cmd', ['/bin/true']), **kw)
+            return child_mock.call_args.args[1], child_mock.call_args.kwargs['expand_cwd']
+
+        self.ae(child_kwargs(False, cwd='/w$X'), ('/w$X', True))
+        self.ae(child_kwargs(True, cwd='/w$X', expand_cwd=False), ('/w$X', False))
+        self.ae(child_kwargs(True), ('/tab$X', False))
+        self.ae(child_kwargs(False), ('/tab$X', True))
+        with TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, 'd$X')
+            os.mkdir(d)
+            self.ae(child_kwargs(False, cmd=[d]), (d, False))
+
+    def test_save_as_session_line_injection(self) -> None:
+        # Values such as the cwd reported via OSC 7 or user vars are under the
+        # control of programs running in the window and must not be able to
+        # inject lines into the session file
+        from urllib.parse import quote
+
+        from datty.session import default_save_as_session_opts, session_launch_line, session_line_break_pat
+        from datty.tabs import Tab
+        from datty.utils import path_from_osc7_url
+
+        breaks = {chr(c) for c in range(0x110000) if len(f'a{chr(c)}b'.splitlines()) > 1}
+        self.ae(breaks, {chr(c) for c in range(0x110000) if session_line_break_pat.search(chr(c))})
+        opts = self.set_options()
+        for args in (['launch', 'a b', "it's"], ['launch', "a\nb'c\\d e\x85f\x1b", '$HOME']):
+            line = session_launch_line(args)
+            self.ae(line.splitlines(), [line])
+            (s,) = parse_session(line, opts)
+            self.ae(s.tabs[-1].windows[-1].launch_spec.args, args[1:])
+
+        injected = '\nlaunch --type=background touch /tmp/pwned\n#'
+        evil_cwd = path_from_osc7_url('file://host/tmp/x' + quote(injected))
+        evil_var = 'k=a launch --type=background touch /tmp/pwned'
+
+        class Group(list[SimpleNamespace]):
+            def __init__(self, gid: int, *cwds: str):
+                super().__init__(
+                    SimpleNamespace(
+                        id=gid * 10 + i,
+                        cwd_for_serialization=cwd,
+                        as_launch_command=lambda ser_opts, cwd, **kw: ['launch'] + ([f'--cwd={cwd}'] if cwd else []) + [f'--var={evil_var}'],
+                    )
+                    for i, cwd in enumerate(cwds)
+                )
+                self.id, self.docks = gid, ()
+
+        groups = [Group(1, evil_cwd, evil_cwd), Group(2, '/home')]
+        tab = SimpleNamespace(
+            windows=SimpleNamespace(active_group=groups[0], groups=groups, tab_docks=(), dock_owner=lambda g: None),
+            enabled_layouts=['tall'],
+            _current_layout_name='tall',
+            name='name' + injected,
+            serialize_layout_state_for_session=dict,
+        )
+        lines = Tab.serialize_state_as_session(cast(Tab, tab), '', None, default_save_as_session_opts())
+        text = '\n'.join(lines)
+        self.ae(text.splitlines(), lines)
+        self.ae(sum(1 for x in lines if x.startswith('launch')), 3)
+        (s,) = parse_session(text, opts)
+        (t,) = s.tabs
+        self.ae(t.cwd, '/home')
+        self.ae([w.launch_spec.opts.cwd for w in t.windows], [evil_cwd, evil_cwd, '/home'])
+        self.ae({tuple(w.launch_spec.opts.var) for w in t.windows}, {(evil_var,)})
+        self.ae({w.launch_spec.opts.type for w in t.windows}, {'window'})
+
     def test_scrollback_for_restore(self) -> None:
         from datty.logout_session import sanitize_restored_output, scrollback_for_restore
         from datty.window import as_text
@@ -205,6 +414,23 @@ class TestSessions(BaseTest):
         data = scrollback_for_restore(src)
         self.assertIn(b'\x1b]133;C', data)
         self.assertNotIn('\x1b]133;', sanitize_restored_output(data.decode()))
+
+        # Bidi text is restored with the controls it was written under, which are left at their defaults
+        src = self.create_screen(cols=10, lines=4, scrollback=20)
+        parse_bytes(src, '\x1b[8h\x1b[?2501h\x1b[2 kabc אבג 12 abcdefgh\r\n\x1b[8lplain\r\n'.encode())
+        data = scrollback_for_restore(src)
+        restored = restore(data)
+        self.ae(as_text(restored, as_ansi=True, add_history=True), as_text(src, as_ansi=True, add_history=True))
+        self.ae([restored.test_bidi_line_record(y) for y in range(4)], [src.test_bidi_line_record(y) for y in range(4)])
+        # a paragraph cut by the removal of the prompt it ends in
+        src = self.create_screen(cols=10, lines=6, scrollback=20)
+        parse_bytes(src, ('\x1b[8h\x1b[?2501h\x1b[2 k' + 'אבג' * 3 + 'ab\x1b]133;A\x07$ \x1b[8l').encode())
+        data = scrollback_for_restore(src)
+        self.ae(data.decode(), '\x1b[m\x1b[m\x1b[8h\x1b[?2501h\x1b[2 k' + 'אבג' * 3 + 'a\x1b[8l\x1b[?2501l\x1b[0 k')
+        restored = restore(data)
+        self.ae(restored.test_bidi_line_record(0), (1, True, True))
+        parse_bytes(restored, b'\r\nx')
+        self.ae(restored.test_bidi_line_record(1), (0, False, False))
 
         # Output larger than the parser buffer
         big = self.create_screen(cols=80, lines=4, scrollback=20)
@@ -525,8 +751,9 @@ class TestSessions(BaseTest):
         from datty.boss import Boss
         from datty.layout.interface import Tall
         from datty.tabs import Tab
+        from datty.types import DockSpec
         from datty.window import Window as RealWindow
-        from datty.window_list import WindowList, reset_group_id_counter
+        from datty.window_list import WindowGroup, WindowList, reset_group_id_counter
 
         from .layout import Window as LayoutWindow
         from .layout import create_layout
@@ -546,6 +773,7 @@ class TestSessions(BaseTest):
 
         class FakeTab:
             name = cwd = ''
+            cwd_is_expanded = False
             enabled_layouts, _last_used_layout, _current_layout_name = ['tall'], None, ''
 
             def __init__(self, tm: 'FakeTabManager', session: str, *windows: FakeWindow) -> None:
@@ -601,13 +829,18 @@ class TestSessions(BaseTest):
             def sync_os_window_docks(self) -> None:
                 pass
 
+            def __iter__(self) -> Iterator[FakeTab]:
+                return iter(self.tabs)
+
+            update_tab_bar_data = mark_tab_bar_dirty = sync_os_window_docks
+
         class FakeBoss:
             shutting_down = False
             suppress_focus_change_events = nullcontext
 
             def __init__(self) -> None:
                 self.os_window_map: dict[int, FakeTabManager] = {}
-                real = '_move_window_to _move_tab_to _insert_window_in_direction _new_os_window_for_session _cleanup_tab_after_window_removal'
+                real = '_move_window_to _move_tab_to _insert_window_in_direction _new_os_window_for_session _cleanup_tab_after_window_removal _set_session_of'
                 for name in real.split():
                     setattr(self, name, getattr(Boss, name).__get__(self))
 
@@ -620,6 +853,10 @@ class TestSessions(BaseTest):
             def all_tabs(self) -> Iterator[FakeTab]:
                 for tm in self.os_window_map.values():
                     yield from tm.tabs
+
+            @property
+            def all_tab_managers(self) -> Iterator[FakeTabManager]:
+                return iter(self.os_window_map.values())
 
             def mark_os_window_for_close(self, os_window_id: int) -> None:
                 pass
@@ -684,3 +921,131 @@ class TestSessions(BaseTest):
             tab_a.created_in_session_name = boss.os_window_map[1].created_in_session_name = ''
             cast(Boss, boss)._move_window_to(cast(RealWindow, unnamed), 'new')
             self.ae(sessions(unnamed), ('', '', ''))
+
+            # set-session: changing the session of existing windows and tabs in place
+            def set_session(boss: FakeBoss, name: str, windows: tuple[FakeWindow, ...] = (), tabs: tuple[FakeTab, ...] = ()) -> None:
+                cast(Boss, boss)._set_session_of(name, cast(tuple[RealWindow, ...], windows), cast(tuple[Tab, ...], tabs))
+
+            # A window sharing its tab with windows of another session stays in its tab, which keeps its session
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            last = list(tab_a)[-1]
+            set_session(boss, 'x', (unnamed,))
+            self.ae(sessions(unnamed), ('x', 'a', 'a'))
+            self.ae([w.effective_session_name for w in tab_a], ['x', 'b', 'a'])
+            self.ae(last.created_in_session_name, '')
+            # Removing it from its session leaves it in the session of its tab
+            set_session(boss, '', (unnamed,))
+            self.ae(sessions(unnamed), ('a', 'a', 'a'))
+
+            # Moving all windows of a tab moves the tab, and the OS Window when all its tabs are moved
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            set_session(boss, 'x', tuple(tab_a))
+            self.ae(sessions(unnamed), ('x', 'x', 'a'))
+            set_session(boss, 'x', tuple(boss.os_window_map[1].tabs[1]))
+            self.ae(sessions(unnamed), ('x', 'x', 'x'))
+
+            # A window alone in its tab takes the tab and OS Window with it, also when moved to no session
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            (only,) = tuple(tab_b)
+            set_session(boss, 'x', (only,))
+            self.ae(sessions(only), ('x', 'x', 'x'))
+            set_session(boss, '', (only,))
+            self.ae((sessions(only), only.created_in_session_name), (('', '', ''), ''))
+
+            # The tab is moved when the other windows in it are already in the target session,
+            # without changing the session of windows that belong to it through their tab
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            set_session(boss, 'a', (from_b,))
+            self.ae((sessions(from_b), tab_a.created_in_session_name), (('a', 'a', 'a'), 'a'))
+            set_session(boss, 'b', (from_b,))
+            self.ae(sessions(from_b), ('b', 'a', 'a'))
+            set_session(boss, '', (from_b,))
+            self.ae((sessions(from_b), from_b.created_in_session_name), (('a', 'a', 'a'), ''))
+            self.ae([w.created_in_session_name for w in tab_a], ['', '', ''])
+
+            # A whole tab is moved with all its windows, whatever their session
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            set_session(boss, 'x', tabs=(tab_a,))
+            self.ae([w.created_in_session_name for w in tab_a], ['x'] * 3)
+            self.ae(sessions(unnamed), ('x', 'x', 'a'))
+            # Windows in a matched tab are not considered separately
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            set_session(boss, 'x', (unnamed,), (tab_b,))
+            self.ae((sessions(unnamed), sessions(next(iter(tab_b)))), (('x', 'a', 'a'), ('x', 'x', 'x')))
+
+            # Overlays and the docks of a window go with it, the docks of a tab go with the tab
+            def add(
+                tab: FakeTab, session: str, group_of: FakeWindow | None = None, dock: DockSpec | None = None, dock_owner: WindowGroup | None = None
+            ) -> FakeWindow:
+                w = FakeWindow(session)
+                w.change_tab(tab)
+                tab.windows.add_window(cast(RealWindow, w), group_of=cast(RealWindow | None, group_of), dock=dock, dock_owner=dock_owner)
+                return w
+
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            (only,) = tuple(tab_b)
+            overlay = add(tab_b, 'b', group_of=only)
+            group = tab_b.windows.group_for_window(only)
+            window_dock = add(tab_b, '', dock=DockSpec(), dock_owner=group)
+            tab_dock, tab_dock_of_no_session = add(tab_b, 'b', dock=DockSpec()), add(tab_b, '', dock=DockSpec())
+            set_session(boss, 'x', (only,))
+            self.ae(sessions(only), ('x', 'x', 'x'))
+            self.ae([w.effective_session_name for w in (overlay, window_dock, tab_dock, tab_dock_of_no_session)], ['x'] * 4)
+            # A tab dock is not moved with a window that does not take its tab along
+            boss, unnamed, from_b, tab_a, tab_b = world()
+            tab_dock = add(tab_a, '', dock=DockSpec())
+            set_session(boss, 'x', (unnamed,))
+            self.ae((sessions(unnamed), tab_dock.effective_session_name), (('x', 'a', 'a'), 'a'))
+
+    def test_set_session_command(self) -> None:
+        from datty.boss import Boss
+        from datty.options.utils import KeyAction, parse_key_action
+        from datty.rc.base import MatchError, PayloadGetter, RemoteControlErrorWithoutTraceback
+        from datty.rc.set_session import set_session
+        from datty.window import Window
+
+        # The action accepts the arguments of the remote control command
+        self.ae(parse_key_action('set_session --match-tab=state:active "my work"'), KeyAction('set_session', ('--match-tab=state:active', 'my work')))
+        self.ae(parse_key_action('set_session !'), KeyAction('set_session', ('!',)))
+
+        calls: list[tuple[str, list[object], list[object]]] = []
+        own, active = SimpleNamespace(effective_session_name='mine'), SimpleNamespace(effective_session_name='act')
+
+        class FakeBoss:
+            active_window: object = active
+
+            def match_windows(self, match: str, self_window: object = None) -> list[object]:
+                return [match] if match != 'none' else []
+
+            def match_tabs(self, match: str) -> list[object]:
+                return [f'tab:{match}'] if match != 'none' else []
+
+            def _set_session_of(self, name: str, ws: list[object], tabs: list[object]) -> None:
+                calls.append((name, ws, tabs))
+
+        def run(payload: dict[str, str | bool], window: object = own, active_window: object = active) -> tuple[str, list[object], list[object]]:
+            calls.clear()
+            boss = FakeBoss()
+            boss.active_window = active_window
+            set_session.response_from_datty(cast(Boss, boss), cast(Window, window), PayloadGetter(set_session, dict(payload)))
+            return calls[0]
+
+        # By default the active window, with --self the window the command is run in
+        self.ae(run({'session': 'work'}), ('work', [active], []))
+        self.ae(run({'session': 'work', 'self': True}), ('work', [own], []))
+        self.ae(run({'session': 'work', 'self': True}, None), ('work', [active], []))
+        # . is the session of the window the command is run in, else of the active window
+        self.ae(run({'session': '.'}), ('mine', [active], []))
+        self.ae(run({'session': '.'}, None), ('act', [active], []))
+        self.ae(run({'session': '!'}), ('', [active], []))
+        self.ae(run({'session': 'w', 'match': 'id:1'}), ('w', ['id:1'], []))
+        self.ae(run({'session': 'w', 'match_tab': 'id:2'}), ('w', [], ['tab:id:2']))
+        self.ae(run({'session': 'w', 'match': 'id:1', 'match_tab': 'id:2'}), ('w', ['id:1'], ['tab:id:2']))
+        for payload in ({'session': 'w', 'match': 'none'}, {'session': 'w', 'match_tab': 'none'}):
+            with self.assertRaises(MatchError):
+                run(payload)
+        for payload in ({}, {'session': ''}):
+            with self.assertRaises(RemoteControlErrorWithoutTraceback):
+                run(payload)
+        with self.assertRaises(RemoteControlErrorWithoutTraceback):
+            run({'session': '.'}, None, None)

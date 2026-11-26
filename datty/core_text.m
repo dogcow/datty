@@ -9,6 +9,7 @@
 #include "cleanup.h"
 #include "fonts.h"
 #include "unicode-data.h"
+#include "font-select.h"
 #include <structmember.h>
 #include <stdint.h>
 #include <math.h>
@@ -143,19 +144,31 @@ dealloc(CTFace *self) {
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
-static const char *
-tag_to_string(uint32_t tag, uint8_t bytes[5]) {
-    bytes[0] = (tag >> 24) & 0xff;
-    bytes[1] = (tag >> 16) & 0xff;
-    bytes[2] = (tag >> 8) & 0xff;
-    bytes[3] = (tag) & 0xff;
-    bytes[4] = 0;
-    return (const char *)bytes;
+// OpenType tags are supposed to be printable ASCII but fonts in the wild can
+// contain arbitrary bytes, which are not valid UTF-8. Use Latin-1 so that any
+// tag converts to a four character string and back losslessly.
+static PyObject *
+tag_to_python(uint32_t tag) {
+    const char b[4] = {(char)(tag >> 24), (char)(tag >> 16), (char)(tag >> 8), (char)tag};
+    return PyUnicode_DecodeLatin1(b, sizeof(b), NULL);
 }
 
-static uint32_t
-string_to_tag(const uint8_t *bytes) {
-    return (((uint32_t)bytes[0]) << 24) | (((uint32_t)bytes[1]) << 16) | (((uint32_t)bytes[2]) << 8) | bytes[3];
+static bool
+tag_from_python(PyObject *s, uint32_t *tag) {
+    if (!PyUnicode_Check(s) || PyUnicode_GET_LENGTH(s) != 4) {
+        PyErr_Format(PyExc_ValueError, "%R is not a valid OpenType tag", s);
+        return false;
+    }
+    *tag = 0;
+    for (Py_ssize_t i = 0; i < 4; i++) {
+        const Py_UCS4 ch = PyUnicode_READ_CHAR(s, i);
+        if (ch > 0xff) {
+            PyErr_Format(PyExc_ValueError, "%R is not a valid OpenType tag", s);
+            return false;
+        }
+        *tag = (*tag << 8) | ch;
+    }
+    return true;
 }
 
 FontFeatures *
@@ -169,12 +182,12 @@ add_variation_pair(const void *key_, const void *value_, void *ctx) {
     CFNumberRef key = key_, value = value_;
     uint32_t tag;
     double val;
+    if (PyErr_Occurred()) return;
     if (!CFNumberGetValue(key, kCFNumberSInt32Type, &tag)) return;
     if (!CFNumberGetValue(value, kCFNumberDoubleType, &val)) return;
-    uint8_t tag_string[5];
-    tag_to_string(tag, tag_string);
+    RAII_PyObject(pykey, tag_to_python(tag));
     RAII_PyObject(pyval, PyFloat_FromDouble(val));
-    if (pyval) PyDict_SetItemString(ans, (const char *)tag_string, pyval);
+    if (pykey && pyval) PyDict_SetItem(ans, pykey, pyval);
 }
 
 static PyObject *
@@ -256,7 +269,7 @@ font_descriptor_to_python(CTFontDescriptorRef descriptor) {
 }
 
 static CTFontDescriptorRef
-font_descriptor_from_python(PyObject *src) {
+font_descriptor_from_python(PyObject *src, bool use_path) {
     CTFontSymbolicTraits symbolic_traits = 0;
     RAII_CoreFoundation(CFMutableDictionaryRef, ans, CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
     PyObject *t = PyDict_GetItemString(src, "traits");
@@ -283,21 +296,37 @@ font_descriptor_from_python(PyObject *src) {
     SET(style, kCTFontStyleNameAttribute);
     SET(postscript_name, kCTFontNameAttribute);
 #undef SET
+    // Pin the descriptor to the font file it came from, as different font
+    // files can have the same PostScript name, for example, the default named
+    // instance of a variable font and the corresponding static font.
+    if (use_path && (t = PyDict_GetItemString(src, "path")) && PyUnicode_Check(t)) {
+        Py_ssize_t sz;
+        const char *path = PyUnicode_AsUTF8AndSize(t, &sz);
+        if (!path) return NULL;
+        if (sz) {
+            RAII_CoreFoundation(CFURLRef, url, CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const unsigned char *)path, sz, false));
+            if (url) CFDictionaryAddValue(ans, kCTFontURLAttribute, url);
+        }
+    }
     if ((t = PyDict_GetItemString(src, "axis_map"))) {
         RAII_CoreFoundation(
             CFMutableDictionaryRef, axis_map, CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
         PyObject *key, *value;
         Py_ssize_t pos = 0;
         while (PyDict_Next(t, &pos, &key, &value)) {
-            double val = PyFloat_AS_DOUBLE(value);
-            uint32_t tag = string_to_tag((const uint8_t *)PyUnicode_AsUTF8(key));
+            const double val = PyFloat_AsDouble(value);
+            if (val == -1 && PyErr_Occurred()) return NULL;
+            uint32_t tag;
+            if (!tag_from_python(key, &tag)) return NULL;
             RAII_CoreFoundation(CFNumberRef, cf_tag, CFNumberCreate(NULL, kCFNumberSInt32Type, &tag));
             RAII_CoreFoundation(CFNumberRef, cf_val, CFNumberCreate(NULL, kCFNumberDoubleType, &val));
             CFDictionaryAddValue(axis_map, cf_tag, cf_val);
         }
         CFDictionaryAddValue(ans, kCTFontVariationAttribute, axis_map);
     }
-    return CTFontDescriptorCreateWithAttributes(ans);
+    CTFontDescriptorRef desc = CTFontDescriptorCreateWithAttributes(ans);
+    if (!desc) PyErr_SetString(PyExc_ValueError, "Failed to create CTFontDescriptor object");
+    return desc;
 }
 
 static CTFontCollectionRef all_fonts_collection_data = NULL;
@@ -379,7 +408,8 @@ nerd_font(CGFloat sz) {
             bool is_nerd_font = cf_string_equals(name, CFSTR("SymbolsNFM"));
             CFRelease(name);
             if (is_nerd_font) {
-                _nerd_font_descriptor = CTFontDescriptorCreateCopyWithAttributes(descriptor, CTFontDescriptorCopyAttributes(descriptor));
+                RAII_CoreFoundation(CFDictionaryRef, attributes, CTFontDescriptorCopyAttributes(descriptor));
+                _nerd_font_descriptor = CTFontDescriptorCreateCopyWithAttributes(descriptor, attributes);
                 break;
             }
         }
@@ -744,9 +774,29 @@ face_from_descriptor(PyObject *descriptor, FONTS_DATA_HANDLE fg) {
             }
         }
     }
-    if (!desc) desc = font_descriptor_from_python(descriptor);
-    if (!desc) return NULL;
-    RAII_CoreFoundation(CTFontRef, font, CTFontCreateWithFontDescriptor(desc, fg ? scaled_point_sz(fg) : 12, NULL));
+    const CGFloat sz = fg ? scaled_point_sz(fg) : 12;
+    RAII_CoreFoundation(CTFontRef, font, NULL);
+    if (desc) font = CTFontCreateWithFontDescriptor(desc, sz, NULL);
+    else {
+        desc = font_descriptor_from_python(descriptor, true);
+        if (!desc) return NULL;
+        font = CTFontCreateWithFontDescriptor(desc, sz, NULL);
+        PyObject *dpath = PyDict_GetItemString(descriptor, "path");
+        if (font && dpath && PyUnicode_Check(dpath) && PyUnicode_GET_LENGTH(dpath)) {
+            // If the font file no longer exists CoreText returns some unrelated
+            // default font, so fall back to matching without the path.
+            RAII_PyObject(path, get_path_for_font(font));
+            if (!path) return NULL;
+            if (PyUnicode_Compare(path, dpath) != 0) {
+                CFRelease(font);
+                font = NULL;
+                CFRelease(desc);
+                desc = font_descriptor_from_python(descriptor, false);
+                if (!desc) return NULL;
+                font = CTFontCreateWithFontDescriptor(desc, sz, NULL);
+            }
+        }
+    }
     if (!font) {
         PyErr_SetString(PyExc_ValueError, "Failed to create CTFont object");
         return NULL;
@@ -755,12 +805,12 @@ face_from_descriptor(PyObject *descriptor, FONTS_DATA_HANDLE fg) {
 }
 
 PyObject *
-face_from_path(const char *path, int UNUSED index, FONTS_DATA_HANDLE fg UNUSED) {
+face_from_path(const char *path, int UNUSED index, FONTS_DATA_HANDLE fg) {
     RAII_CoreFoundation(CFStringRef, s, CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8));
     RAII_CoreFoundation(CFURLRef, url, CFURLCreateWithFileSystemPath(kCFAllocatorDefault, s, kCFURLPOSIXPathStyle, false));
     RAII_CoreFoundation(CGDataProviderRef, dp, CGDataProviderCreateWithURL(url));
     RAII_CoreFoundation(CGFontRef, cg_font, CGFontCreateWithDataProvider(dp));
-    RAII_CoreFoundation(CTFontRef, ct_font, CTFontCreateWithGraphicsFont(cg_font, 0.0, NULL, NULL));
+    RAII_CoreFoundation(CTFontRef, ct_font, CTFontCreateWithGraphicsFont(cg_font, fg ? scaled_point_sz(fg) : 0.0, NULL, NULL));
     return (PyObject *)ct_face(ct_font, NULL);
 }
 
@@ -792,6 +842,7 @@ static struct RenderBuffers buffers = {0};
 
 static void
 finalize(void) {
+    fs_finalize_selection();
     free(ft_buffer.buf);
     ft_buffer.buf = NULL;
     ft_buffer.capacity = 0;
@@ -868,8 +919,9 @@ setup_ctx_for_alpha_mask(CGContextRef render_ctx) {
     CGContextSetTextMatrix(render_ctx, CGAffineTransformIdentity);
 }
 
+// fonts, if not NULL, holds the font for each glyph, NULL meaning font
 static void
-render_glyphs(CTFontRef font, unsigned int width, unsigned int height, unsigned int baseline, unsigned int num_glyphs) {
+render_glyphs(CTFontRef font, CTFontRef *fonts, unsigned int width, unsigned int height, unsigned int baseline, unsigned int num_glyphs) {
     memset(buffers.render_buf, 0, width * height);
     CGColorSpaceRef gray_color_space = CGColorSpaceCreateDeviceGray();
     if (gray_color_space == NULL) fatal("Out of memory");
@@ -879,7 +931,13 @@ render_glyphs(CTFontRef font, unsigned int width, unsigned int height, unsigned 
     if (render_ctx == NULL) fatal("Out of memory");
     setup_ctx_for_alpha_mask(render_ctx);
     CGContextSetTextPosition(render_ctx, 0, height - baseline);
-    CTFontDrawGlyphs(font, buffers.glyphs, buffers.positions, num_glyphs, render_ctx);
+    if (fonts) {
+        // Draw runs of consecutive glyphs that use the same font together
+        for (unsigned start = 0, end; start < num_glyphs; start = end) {
+            for (end = start + 1; end < num_glyphs && fonts[end] == fonts[start]; end++);
+            CTFontDrawGlyphs(fonts[start] ? fonts[start] : font, buffers.glyphs + start, buffers.positions + start, end - start, render_ctx);
+        }
+    } else CTFontDrawGlyphs(font, buffers.glyphs, buffers.positions, num_glyphs, render_ctx);
     CGContextRelease(render_ctx);
 }
 
@@ -903,7 +961,7 @@ render_simple_text_impl(PyObject *s, const char *text, unsigned int baseline) {
     }
     StringCanvas ans = {.width = (size_t)ceil(x), .height = (size_t)(2 * bounding_box.size.height)};
     ensure_render_space(ans.width, ans.height, num_chars);
-    render_glyphs(font, ans.width, ans.height, baseline, num_chars);
+    render_glyphs(font, NULL, ans.width, ans.height, baseline, num_chars);
     ans.canvas = malloc(ans.width * ans.height);
     if (ans.canvas) memcpy(ans.canvas, buffers.render_buf, ans.width * ans.height);
     return ans;
@@ -934,7 +992,7 @@ render_codepoint(CTFace *self, PyObject *args) {
     if (CTFontSupportsColorGlyphs(self->ct_font)) {
         render_color_glyph(self->ct_font, (uint8_t *)PyBytes_AS_STRING(pbuf), buffers.glyphs[0], ans.width, ans.height, baseline);
     } else {
-        render_glyphs(self->ct_font, ans.width, ans.height, baseline, num_chars);
+        render_glyphs(self->ct_font, NULL, ans.width, ans.height, baseline, num_chars);
         uint8_t r = (fg >> 16) & 0xff, g = (fg >> 8) & 0xff, b = fg & 0xff;
         const uint8_t *last_pixel = (uint8_t *)PyBytes_AS_STRING(pbuf) + PyBytes_GET_SIZE(pbuf) - sizeof(pixel);
         const uint8_t *s_limit = buffers.render_buf + canvas_width * canvas_height;
@@ -1001,7 +1059,7 @@ render_sample_text(CTFace *self, PyObject *args) {
         buffers.glyphs[i] = info[i].codepoint;
         num_glyphs++;
     }
-    render_glyphs(font, canvas_width, canvas_height, fcm.baseline, num_glyphs);
+    render_glyphs(font, NULL, canvas_width, canvas_height, fcm.baseline, num_glyphs);
     uint8_t r = (fg >> 16) & 0xff, g = (fg >> 8) & 0xff, b = fg & 0xff;
     const uint8_t *last_pixel = (uint8_t *)PyBytes_AS_STRING(pbuf) + PyBytes_GET_SIZE(pbuf) - sizeof(pixel);
     const uint8_t *s_limit = buffers.render_buf + canvas_width * canvas_height;
@@ -1039,12 +1097,12 @@ ensure_ui_font(size_t in_height) {
 
 bool
 cocoa_render_line_of_text(const char *text, const color_type fg, const color_type bg, uint8_t *rgba_output, const size_t width, const size_t height) {
+    if (!ensure_ui_font(height)) return false;
     CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
     if (color_space == NULL) return false;
     CGContextRef ctx = CGBitmapContextCreate(rgba_output, width, height, 8, 4 * width, color_space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault);
     CGColorSpaceRelease(color_space);
     if (ctx == NULL) return false;
-    if (!ensure_ui_font(height)) return false;
 
     CGContextSetShouldAntialias(ctx, true);
     CGContextSetShouldSmoothFonts(ctx, true); // sub-pixel antialias
@@ -1178,43 +1236,11 @@ do_render(
     unsigned int num_cells,
     unsigned int baseline,
     bool *was_colored,
-    bool allow_resize,
-    FONTS_DATA_HANDLE fg,
     GlyphRenderInfo *ri) {
     unsigned int canvas_width = cell_width * num_cells;
     ensure_render_space(canvas_width, cell_height, num_glyphs);
     CGRect br = CTFontGetBoundingRectsForGlyphs(ct_font, kCTFontOrientationHorizontal, buffers.glyphs, buffers.boxes, num_glyphs);
     const bool debug_rendering = false;
-    if (allow_resize) {
-        // Resize glyphs that would bleed into neighboring cells, by scaling the font size
-        float right = 0;
-        for (unsigned i = 0; i < num_glyphs; i++) right = MAX(right, buffers.boxes[i].origin.x + buffers.boxes[i].size.width);
-        if (!bold && !italic && right > canvas_width + 1) {
-            if (debug_rendering) printf("resizing glyphs, right: %f canvas_width: %u\n", right, canvas_width);
-            CGFloat sz = CTFontGetSize(ct_font);
-            sz *= canvas_width / right;
-            CTFontRef new_font = CTFontCreateCopyWithAttributes(ct_font, sz, NULL, NULL);
-            bool ret = do_render(
-                new_font,
-                CTFontGetUnitsPerEm(new_font),
-                bold,
-                italic,
-                info,
-                hb_positions,
-                num_glyphs,
-                canvas,
-                cell_width,
-                cell_height,
-                num_cells,
-                baseline,
-                was_colored,
-                false,
-                fg,
-                ri);
-            CFRelease(new_font);
-            return ret;
-        }
-    }
     CGFloat x = 0, y = 0;
     CGFloat scale = CTFontGetSize(ct_font) / units_per_em;
     for (unsigned i = 0; i < num_glyphs; i++) {
@@ -1234,18 +1260,88 @@ do_render(
         x += hb_positions[i].x_advance * scale;
         y += hb_positions[i].y_advance * scale;
     }
+    // Resize glyphs that would bleed into neighboring cells, by drawing them
+    // with a smaller font. Glyphs are checked and resized individually, as in
+    // the FreeType renderer, so that a combining mark does not cause its base
+    // glyph to be shrunk, or the other way around. fonts[i] is the font
+    // glyph i is drawn with, NULL meaning ct_font.
+    RAII_ALLOC(CTFontRef, fonts, NULL);
+    // The left edge of the ink of the resized glyphs, as positioned in the canvas
+    CGFloat resized_left = 0;
+    if (!bold && !italic) {
+        for (unsigned i = 0; i < num_glyphs; i++) {
+            const CGRect box = buffers.boxes[i];
+            if (box.size.width <= 0) continue;
+            // The width of the glyph in whole pixels, as rasterized, which is
+            // what the FreeType renderer uses
+            const CGFloat extra = ceil(box.origin.x + box.size.width) - floor(box.origin.x) - canvas_width;
+            if (extra <= 1) continue;
+            // there exist fonts that have glyphs a little wider than their
+            // advances, such as wide letters that borrow space from a narrow
+            // neighbor. Rather than rescale, which looks bad, we just crop the
+            // glyph to the cell. The allowance is 2/10 of the cell width, with
+            // a minimum of 2px, the same as in the FreeType renderer. Colored
+            // glyphs are always rescaled, as with FreeType.
+            // See https://github.com/kovidgoyal/datty/issues/352
+            if (!*was_colored && num_cells == 1 && (extra <= 2 || extra * 10 <= cell_width * 2)) continue;
+            if (!fonts) {
+                fonts = calloc(num_glyphs, sizeof(fonts[0]));
+                if (!fonts) fatal("Out of memory");
+            }
+            const CGFloat sz = CTFontGetSize(ct_font) * canvas_width / box.size.width;
+            if (debug_rendering) printf("resizing glyph: %u width: %f canvas_width: %u size: %f\n", i, box.size.width, canvas_width, sz);
+            fonts[i] = CTFontCreateCopyWithAttributes(ct_font, sz, NULL, NULL);
+            if (!fonts[i]) fatal("Out of memory");
+            CTFontGetBoundingRectsForGlyphs(fonts[i], kCTFontOrientationHorizontal, buffers.glyphs + i, buffers.boxes + i, 1);
+            resized_left = MIN(resized_left, buffers.positions[i].x + buffers.boxes[i].origin.x);
+        }
+    }
+    if (fonts) {
+        br = CGRectNull;
+        for (unsigned i = 0; i < num_glyphs; i++) {
+            if (buffers.boxes[i].size.width > 0) br = CGRectUnion(br, buffers.boxes[i]);
+        }
+        if (CGRectIsNull(br)) br = CGRectZero;
+    }
+    // The horizontal extent of the ink of the glyphs, as positioned in the canvas
+    CGFloat left = canvas_width, right = 0;
+    for (unsigned i = 0; i < num_glyphs; i++) {
+        if (buffers.boxes[i].size.width <= 0) continue;
+        left = MIN(left, buffers.positions[i].x + buffers.boxes[i].origin.x);
+        right = MAX(right, buffers.positions[i].x + buffers.boxes[i].origin.x + buffers.boxes[i].size.width);
+    }
+    CGFloat dx = 0;
+    // Colored glyphs are placed by render_color_glyph()
+    if (right > left && !*was_colored) {
+        if (resized_left < 0) {
+            // A resized glyph, such as a letter with marks that hang to the
+            // left of its cell, shift it so the marks are not cut off. The
+            // glyphs are shifted together, so that combining marks stay in
+            // place relative to their base glyph.
+            dx = -resized_left;
+        } else if (right > canvas_width && left > 0 && num_glyphs < 4) {
+            // Move the glyphs back into the canvas, as far as their left bearing allows
+            dx = -MIN(left, right - canvas_width);
+        }
+        for (unsigned i = 0; i < num_glyphs; i++) buffers.positions[i].x += dx;
+    }
     if (*was_colored) {
-        render_color_glyph(ct_font, (uint8_t *)canvas, info[0].codepoint, cell_width * num_cells, cell_height, baseline);
+        render_color_glyph(fonts && fonts[0] ? fonts[0] : ct_font, (uint8_t *)canvas, info[0].codepoint, cell_width * num_cells, cell_height, baseline);
     } else {
-        render_glyphs(ct_font, canvas_width, cell_height, baseline, num_glyphs);
+        render_glyphs(ct_font, fonts, canvas_width, cell_height, baseline, num_glyphs);
         Region src = {.bottom = cell_height, .right = canvas_width}, dest = {.bottom = cell_height, .right = canvas_width};
         render_alpha_mask(buffers.render_buf, canvas, &src, &dest, canvas_width, canvas_width, 0xffffff);
+    }
+    if (fonts) {
+        for (unsigned i = 0; i < num_glyphs; i++) {
+            if (fonts[i]) CFRelease(fonts[i]);
+        }
     }
     ri->canvas_width = canvas_width;
     ri->rendered_width = (unsigned)ceil(x);
     ri->x = 0;
     // FiraCode ligatures result in negative origins
-    if (br.origin.x > 0) ri->x = (int)br.origin.x;
+    if (br.origin.x + dx > 0) ri->x = (int)(br.origin.x + dx);
     return true;
 }
 
@@ -1263,7 +1359,7 @@ render_glyphs_in_cells(
     unsigned int num_cells,
     unsigned int baseline,
     bool *was_colored,
-    FONTS_DATA_HANDLE fg,
+    FONTS_DATA_HANDLE fg UNUSED,
     GlyphRenderInfo *ri) {
     CTFace *self = (CTFace *)s;
     // Emoji presentation codepoints rendered with a monochrome font must use the foreground color
@@ -1271,22 +1367,7 @@ render_glyphs_in_cells(
     ensure_render_space(128, 128, num_glyphs);
     for (unsigned i = 0; i < num_glyphs; i++) buffers.glyphs[i] = info[i].codepoint;
     return do_render(
-        self->ct_font,
-        self->units_per_em,
-        bold,
-        italic,
-        info,
-        hb_positions,
-        num_glyphs,
-        canvas,
-        cell_width,
-        cell_height,
-        num_cells,
-        baseline,
-        was_colored,
-        true,
-        fg,
-        ri);
+        self->ct_font, self->units_per_em, bold, italic, info, hb_positions, num_glyphs, canvas, cell_width, cell_height, num_cells, baseline, was_colored, ri);
 }
 
 // Font tables {{{
@@ -1436,34 +1517,326 @@ add_font_file(PyObject UNUSED *_self, PyObject *args) {
     const unsigned char *path = NULL;
     Py_ssize_t sz;
     if (!PyArg_ParseTuple(args, "s#", &path, &sz)) return NULL;
+    fs_wait_for_selection_thread();
     RAII_CoreFoundation(CFURLRef, url, CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, path, sz, false));
     if (CTFontManagerRegisterFontsForURL(url, kCTFontManagerScopeProcess, NULL)) Py_RETURN_TRUE;
     Py_RETURN_FALSE;
 }
 
-static PyObject *
-set_builtin_nerd_font(PyObject UNUSED *self, PyObject *pypath) {
-    if (!PyUnicode_Check(pypath)) {
-        PyErr_SetString(PyExc_TypeError, "path must be a string");
-        return NULL;
+// Font selection backend, see font-select.h {{{
+// This code runs in the font selection thread, so it must not use Python.
+// CoreText font descriptors and fonts are thread safe.
+
+static char *
+ct_strdup(const char *s) {
+    char *ans = strdup(s ? s : "");
+    if (!ans) fatal("Out of memory");
+    return ans;
+}
+
+static char *
+cfstring_to_cstr(CFTypeRef src) {
+    if (!src || CFGetTypeID(src) != CFStringGetTypeID()) return ct_strdup("");
+    CFStringRef s = (CFStringRef)src;
+    const char *fast = CFStringGetCStringPtr(s, kCFStringEncodingUTF8);
+    if (fast) return ct_strdup(fast);
+    const CFIndex sz = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
+    char *buf = malloc(sz);
+    if (!buf) fatal("Out of memory");
+    if (!CFStringGetCString(s, buf, sz, kCFStringEncodingUTF8)) buf[0] = 0;
+    return buf;
+}
+
+static char *
+copy_string_attribute(CTFontDescriptorRef desc, CFStringRef attribute) {
+    RAII_CoreFoundation(CFTypeRef, val, CTFontDescriptorCopyAttribute(desc, attribute));
+    return cfstring_to_cstr(val);
+}
+
+static bool
+descriptor_is_monospace(CTFontDescriptorRef desc) {
+    // Same as coretext_all_fonts(), fonts without symbolic traits are considered monospace
+    RAII_CoreFoundation(CFDictionaryRef, traits, CTFontDescriptorCopyAttribute(desc, kCTFontTraitsAttribute));
+    if (!traits) return true;
+    CFNumberRef value = (CFNumberRef)CFDictionaryGetValue(traits, kCTFontSymbolicTrait);
+    if (!value) return true;
+    unsigned long symbolic_traits = 0;
+    CFNumberGetValue(value, kCFNumberLongType, &symbolic_traits);
+    return (symbolic_traits & kCTFontTraitMonoSpace) != 0;
+}
+
+// Must be kept in sync with font_descriptor_to_python()
+static FSCandidate *
+candidate_from_descriptor(FSContext *ctx, CTFontDescriptorRef desc) {
+    FSCandidate *c = fs_new_candidate(ctx);
+    CFRetain(desc);
+    c->handle = (void *)desc;
+    RAII_CoreFoundation(CFURLRef, url, CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute));
+    uint8_t buf[4096];
+    c->path = ct_strdup((url && CFURLGetFileSystemRepresentation(url, true, buf, sizeof(buf))) ? (const char *)buf : "");
+    c->postscript_name = copy_string_attribute(desc, kCTFontNameAttribute);
+    c->family = copy_string_attribute(desc, kCTFontFamilyNameAttribute);
+    c->style = copy_string_attribute(desc, kCTFontStyleNameAttribute);
+    c->full_name = copy_string_attribute(desc, kCTFontDisplayNameAttribute);
+    RAII_CoreFoundation(CFDictionaryRef, traits, CTFontDescriptorCopyAttribute(desc, kCTFontTraitsAttribute));
+    unsigned long symbolic_traits = 0;
+    float weight = 0, width = 0, slant = 0;
+    if (traits) {
+#define get_number(key, output, type_)                                      \
+    {                                                                       \
+        CFNumberRef value = (CFNumberRef)CFDictionaryGetValue(traits, key); \
+        if (value) CFNumberGetValue(value, type_, &output);                 \
     }
-    const char *path = NULL;
-    Py_ssize_t sz;
-    path = PyUnicode_AsUTF8AndSize(pypath, &sz);
-    RAII_CoreFoundation(CFURLRef, url, CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const unsigned char *)path, sz, false));
-    RAII_CoreFoundation(CFArrayRef, descriptors, CTFontManagerCreateFontDescriptorsFromURL(url));
+        get_number(kCTFontSymbolicTrait, symbolic_traits, kCFNumberLongType);
+        get_number(kCTFontWeightTrait, weight, kCFNumberFloatType);
+        get_number(kCTFontWidthTrait, width, kCFNumberFloatType);
+        get_number(kCTFontSlantTrait, slant, kCFNumberFloatType);
+#undef get_number
+    }
+    c->weight = weight;
+    c->width = width;
+    c->slant = slant;
+    c->bold = (symbolic_traits & kCTFontBoldTrait) != 0;
+    c->italic = (symbolic_traits & kCTFontItalicTrait) != 0;
+    c->monospace = (symbolic_traits & kCTFontTraitMonoSpace) != 0;
+    c->spacing_is_mono = c->monospace;
+    c->expanded = (symbolic_traits & kCTFontExpandedTrait) != 0;
+    c->condensed = (symbolic_traits & kCTFontCondensedTrait) != 0;
+    RAII_CoreFoundation(CFDictionaryRef, variation, CTFontDescriptorCopyAttribute(desc, kCTFontVariationAttribute));
+    c->variable = variation != NULL;
+    c->variation_count = variation ? (unsigned)CFDictionaryGetCount(variation) : 0;
+    return c;
+}
+
+typedef struct CTBackendData {
+    bool family_names_loaded;
+    size_t num_family_names;
+    char **family_names, **family_keys;
+} CTBackendData;
+
+bool
+fs_backend_init(FSContext *ctx UNUSED) {
+    return true;
+}
+
+void
+fs_backend_free_context_data(void *data) {
+    CTBackendData *d = data;
+    for (size_t i = 0; i < d->num_family_names; i++) {
+        free(d->family_names[i]);
+        free(d->family_keys[i]);
+    }
+    free(d->family_names);
+    free(d->family_keys);
+    free(d);
+}
+
+void
+fs_backend_free_candidate(FSCandidate *c) {
+    if (c->handle) CFRelease((CTFontDescriptorRef)c->handle);
+    c->handle = NULL;
+}
+
+static CTBackendData *
+ct_backend_data(FSContext *ctx) {
+    CTBackendData **d = (CTBackendData **)fs_backend_data(ctx);
+    if (!*d) {
+        *d = calloc(1, sizeof(CTBackendData));
+        if (!*d) fatal("Out of memory");
+    }
+    return *d;
+}
+
+static void
+load_family_names(CTBackendData *d) {
+    if (d->family_names_loaded) return;
+    d->family_names_loaded = true;
+    RAII_CoreFoundation(CFArrayRef, names, CTFontManagerCopyAvailableFontFamilyNames());
+    if (!names) return;
+    const CFIndex count = CFArrayGetCount(names);
+    d->family_names = calloc(count + 1, sizeof(char *));
+    d->family_keys = calloc(count + 1, sizeof(char *));
+    if (!d->family_names || !d->family_keys) fatal("Out of memory");
+    for (CFIndex i = 0; i < count; i++) {
+        d->family_names[d->num_family_names] = cfstring_to_cstr(CFArrayGetValueAtIndex(names, i));
+        d->family_keys[d->num_family_names] = fs_name_to_key(d->family_names[d->num_family_names]);
+        d->num_family_names++;
+    }
+}
+
+static bool
+key_matches(const char *val, const char *key) {
+    char *k = fs_name_to_key(val);
+    const bool ans = strcmp(k, key) == 0;
+    free(k);
+    return ans;
+}
+
+// Append the fonts whose attribute is value, that match key for kind
+static size_t
+append_matching(FSContext *ctx, CFStringRef attribute, const char *value, FSListKind kind, const char *key, bool monospaced, FSCandidateList *out) {
+    RAII_CoreFoundation(CFStringRef, v, CFStringCreateWithCString(NULL, value, kCFStringEncodingUTF8));
+    if (!v) return 0;
+    const void *keys[] = {attribute}, *values[] = {v};
+    RAII_CoreFoundation(CFDictionaryRef, attrs, CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+    if (!attrs) return 0;
+    RAII_CoreFoundation(CTFontDescriptorRef, desc, CTFontDescriptorCreateWithAttributes(attrs));
+    RAII_CoreFoundation(CFSetRef, mandatory, CFSetCreate(NULL, keys, 1, &kCFTypeSetCallBacks));
+    if (!desc || !mandatory) return 0;
+    RAII_CoreFoundation(CFArrayRef, matches, CTFontDescriptorCreateMatchingFontDescriptors(desc, mandatory));
+    if (!matches) return 0;
+    size_t num = 0;
+    for (CFIndex i = 0; i < CFArrayGetCount(matches); i++) {
+        CTFontDescriptorRef d = (CTFontDescriptorRef)CFArrayGetValueAtIndex(matches, i);
+        if (monospaced && !descriptor_is_monospace(d)) continue;
+        const FSCandidate *c = candidate_from_descriptor(ctx, d);
+        bool ok = false;
+        switch (kind) {
+            case FS_LIST_FAMILY: ok = key_matches(c->family, key); break;
+            case FS_LIST_POSTSCRIPT_NAME: ok = key_matches(c->postscript_name, key); break;
+            case FS_LIST_FULL_NAME: {
+                // The same key as the full_map in the Python create_font_map()
+                char *f = fs_name_to_key(c->family), *s = fs_name_to_key(c->style);
+                const size_t sz = strlen(f) + strlen(s) + 2;
+                char *full = malloc(sz);
+                if (!full) fatal("Out of memory");
+                snprintf(full, sz, "%s %s", f, s);
+                ok = strcmp(full, key) == 0;
+                free(f);
+                free(s);
+                free(full);
+            } break;
+        }
+        if (ok) {
+            fs_list_append(out, c);
+            num++;
+        }
+    }
+    // CoreText makes a descriptor for the default instance of a variable font,
+    // with an empty variation dictionary, and one for each named instance. The
+    // default descriptor's style name is often Regular even when the default
+    // instance is, for example, ExtraLight. Put it before the named instances
+    // from the same file, so that weight_range_for_family() uses the weight of
+    // the actual Regular named instance. The order otherwise differs from
+    // that of coretext_all_fonts(), which is the font registry's internal order.
+    const FSCandidate **items = out->items + (out->count - num);
+    for (size_t i = 0; i < num; i++) {
+        const FSCandidate *c = items[i];
+        if (!c->variable || c->variation_count) continue;
+        size_t first = 0;
+        while (first < i && strcmp(items[first]->path, c->path) != 0) first++;
+        memmove(items + first + 1, items + first, (i - first) * sizeof(items[0]));
+        items[first] = c;
+    }
+    return num;
+}
+
+bool
+fs_backend_list(FSContext *ctx, FSListKind kind, const char *name, const char *key, bool monospaced, FSCandidateList *out) {
+    // monospace is not a font family on macOS, it is mapped to Menlo by the selection code
+    if (strcmp(key, "monospace") == 0) return true;
+    switch (kind) {
+        case FS_LIST_POSTSCRIPT_NAME: append_matching(ctx, kCTFontNameAttribute, name, kind, key, monospaced, out); break;
+        case FS_LIST_FAMILY:
+            // CoreText matches family names case insensitively, but not whitespace insensitively.
+            // Symbols Nerd Font Mono is often used in symbol_map without being installed, as it
+            // is bundled with datty, and its name is known, so avoid the ~25ms cost of listing
+            // all family names for it.
+            if (!append_matching(ctx, kCTFontFamilyNameAttribute, name, kind, key, monospaced, out) && strcmp(key, "symbols nerd font mono") != 0) {
+                // The name may differ from the actual family name in whitespace
+                CTBackendData *d = ct_backend_data(ctx);
+                load_family_names(d);
+                for (size_t i = 0; i < d->num_family_names; i++) {
+                    if (strcmp(d->family_keys[i], key) == 0 && strcmp(d->family_names[i], name) != 0)
+                        append_matching(ctx, kCTFontFamilyNameAttribute, d->family_names[i], kind, key, monospaced, out);
+                }
+            }
+            break;
+        case FS_LIST_FULL_NAME: {
+            // The full name is the family name followed by the style name, so try every split point
+            char *family = ct_strdup(name);
+            for (size_t i = 0; name[i]; i++) {
+                if (name[i] != ' ') continue;
+                family[i] = 0;
+                append_matching(ctx, kCTFontFamilyNameAttribute, family, kind, key, monospaced, out);
+                family[i] = ' ';
+            }
+            free(family);
+        } break;
+    }
+    return true;
+}
+
+static void
+copy_font_table(CTFontRef font, CTFontTableTag tag, uint8_t **out, size_t *len) {
+    RAII_CoreFoundation(CFDataRef, data, CTFontCopyTable(font, tag, kCTFontTableOptionNoOptions));
+    if (!data) return;
+    const CFIndex n = CFDataGetLength(data);
+    *out = malloc(n ? n : 1);
+    if (!*out) fatal("Out of memory");
+    memcpy(*out, CFDataGetBytePtr(data), n);
+    *len = n;
+}
+
+bool
+fs_backend_font_tables(FSContext *ctx UNUSED, const FSCandidate *c, FSFontTables *out) {
+    memset(out, 0, sizeof(*out));
+    RAII_CoreFoundation(CTFontRef, font, CTFontCreateWithFontDescriptor((CTFontDescriptorRef)c->handle, 12, NULL));
+    if (!font) return false;
+    copy_font_table(font, kCTFontTableFvar, &out->fvar, &out->fvar_len);
+    copy_font_table(font, kCTFontTableSTAT, &out->stat, &out->stat_len);
+    copy_font_table(font, kCTFontTableName, &out->name, &out->name_len);
+    return true;
+}
+
+void
+fs_backend_prepare_builtin_nerd_font(FSContext *ctx, FSBuiltinNerdFont *nf) {
+    RAII_CoreFoundation(CFURLRef, url, CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)nf->path, (CFIndex)strlen(nf->path), false));
+    RAII_CoreFoundation(CFArrayRef, descriptors, url ? CTFontManagerCreateFontDescriptorsFromURL(url) : NULL);
     if (!descriptors || CFArrayGetCount(descriptors) == 0) {
-        PyErr_SetString(PyExc_OSError, "Failed to create descriptor from nerd font path");
-        return NULL;
+        fs_add_message(ctx, "Failed to create a font descriptor for the builtin NERD font from: %s", nf->path);
+        return;
     }
+    nf->handle = (void *)CFRetain(CFArrayGetValueAtIndex(descriptors, 0));
+    nf->prepared = true;
+}
+
+void
+fs_backend_free_builtin_nerd_font(FSBuiltinNerdFont *nf) {
+    if (nf->handle) CFRelease((CTFontDescriptorRef)nf->handle);
+    nf->handle = NULL;
+}
+
+PyObject *
+fs_backend_install_builtin_nerd_font(const FSBuiltinNerdFont *nf) {
+    CTFontDescriptorRef d = (CTFontDescriptorRef)nf->handle;
     if (builtin_nerd_font_descriptor) CFRelease(builtin_nerd_font_descriptor);
-    builtin_nerd_font_descriptor = CFArrayGetValueAtIndex(descriptors, 0);
+    builtin_nerd_font_descriptor = d;
     CFRetain(builtin_nerd_font_descriptor);
     return font_descriptor_to_python(builtin_nerd_font_descriptor);
 }
 
+PyObject *
+fs_backend_descriptor(const FSFont *f) {
+    RAII_PyObject(ans, font_descriptor_to_python((CTFontDescriptorRef)f->base->handle));
+    if (!ans) return NULL;
+    if (f->has_axes) {
+        RAII_PyObject(axis_map, PyDict_New());
+        if (!axis_map) return NULL;
+        for (size_t i = 0; i < f->num_axes; i++) {
+            RAII_PyObject(tag, tag_to_python(f->axes[i].tag));
+            RAII_PyObject(val, PyFloat_FromDouble(f->axes[i].value));
+            if (!tag || !val || PyDict_SetItem(axis_map, tag, val) != 0) return NULL;
+        }
+        if (PyDict_SetItemString(ans, "axis_map", axis_map) != 0) return NULL;
+    }
+    Py_INCREF(ans);
+    return ans;
+}
+// }}}
+
 static PyMethodDef module_methods[] = {
-    METHODB(coretext_all_fonts, METH_O), METHODB(add_font_file, METH_VARARGS), METHODB(set_builtin_nerd_font, METH_O), {NULL, NULL, 0, NULL} /* Sentinel */
+    METHODB(coretext_all_fonts, METH_O), METHODB(add_font_file, METH_VARARGS), {NULL, NULL, 0, NULL} /* Sentinel */
 };
 
 static PyMemberDef members[] = {

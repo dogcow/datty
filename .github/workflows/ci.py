@@ -149,8 +149,8 @@ def install_deps() -> None:
         run('sudo apt-get update')
         run(
             'sudo apt-get install -y --fix-missing libgl1-mesa-dev libxi-dev libxrandr-dev libxinerama-dev ca-certificates'
-            ' libxcursor-dev libxcb-xkb-dev libdbus-1-dev libxkbcommon-dev libharfbuzz-dev libx11-xcb-dev zsh'
-            ' libpng-dev liblcms2-dev libfontconfig-dev libxkbcommon-x11-dev libcanberra-dev libxxhash-dev uuid-dev'
+            ' libxcursor-dev libxcb-xkb-dev libdbus-1-dev libxkbcommon-dev libharfbuzz-dev libfribidi-dev libx11-xcb-dev zsh'
+            ' libpng-dev liblcms2-dev libfontconfig-dev libxkbcommon-x11-dev libcanberra-dev libxxhash-dev uuid-dev libbrotli-dev'
             ' libsimde-dev libsystemd-dev libcairo2-dev zsh bash dash systemd-coredump gdb'
             ' libwayland-dev wayland-protocols glslang-tools'
         )
@@ -291,6 +291,23 @@ IGNORED_DEPENDENCY_CVES = [
     'CVE-2026-103995',  # http response header parsing in stdlib, inapplicable
     'CVE-2026-116566',  # getaddrinfo null bytes, utterly irrelevant
     'CVE-2026-119170',  # openssl fips mode inapplicable
+    'CVE-2026-124249',  # fixed only in unreleased python
+    'CVE-2026-115559',  # fixed only in unreleased python
+    'CVE-2026-115791',  # fixed only in unreleased python
+    'CVE-2026-19552',  # fixed only in unreleased python
+    # openssl, all fixed only in unreleased versions
+    'CVE-2026-95692',
+    'CVE-2026-107496',
+    'CVE-2026-95691',
+    'CVE-2026-88823',
+    'CVE-2026-88822',
+    'CVE-2026-124709',
+    'CVE-2026-107494',
+    'CVE-2026-121482',
+    'CVE-2026-95690',
+    'CVE-2026-84786',
+    'CVE-2026-107493',
+    'CVE-2026-35190',
     # github.com/nwaples/rardecode/v2
     'CVE-2025-11579',  # rardecode is version 2.2.1, not vulnerable
 ]

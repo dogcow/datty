@@ -20,22 +20,29 @@ update_cursor_trail_target(CursorTrail *ct, Window *w, ndc_coords g) {
         case CURSOR_BLOCK:
         case CURSOR_HOLLOW:
         case CURSOR_BEAM:
-        case CURSOR_UNDERLINE: left = g.xstart + WD.screen->cursor_render_info.x * g.dx; bottom = g.ystart - (WD.screen->cursor_render_info.y + 1) * g.dy;
+        case CURSOR_UNDERLINE: {
+            const CursorRenderInfo *cri = &WD.screen->cursor_render_info;
+            // The shape the cursor is drawn with, as in cell_update_uniform_block(), decides its column on a right-to-left cell
+            const CursorShape drawn_shape = (cri->is_focused || OPT(cursor_shape_unfocused) == NO_CURSOR_SHAPE) ? cri->shape : OPT(cursor_shape_unfocused);
+            left = g.xstart + screen_cursor_drawn_x(WD.screen, cri->x, cri->y, drawn_shape) * g.dx;
+            bottom = g.ystart + (cri->y + 1) * g.dy;
+            break;
+        }
         default: break;
     }
     switch (WD.screen->cursor_render_info.shape) {
         case CURSOR_BLOCK:
         case CURSOR_HOLLOW:
             right = left + g.dx;
-            top = bottom + g.dy;
+            top = bottom - g.dy;
             break;
         case CURSOR_BEAM:
             right = left + g.dx / WD.screen->cell_size.width * OPT(cursor_beam_thickness);
-            top = bottom + g.dy;
+            top = bottom - g.dy;
             break;
         case CURSOR_UNDERLINE:
             right = left + g.dx;
-            top = bottom + g.dy / WD.screen->cell_size.height * OPT(cursor_underline_thickness);
+            top = bottom - g.dy / WD.screen->cell_size.height * OPT(cursor_underline_thickness);
             break;
         default: break;
     }
@@ -77,7 +84,21 @@ should_skip_cursor_trail_update(CursorTrail *ct, ndc_coords g, OSWindow *os_wind
     if (!WD.screen->modes.mDECTCEM && ct->opacity <= 0.0f) { return true; }
 
     // moving to a different window is a change of context, so always show the trail for it
-    if ((OPT(cursor_trail_start_threshold_x) > 0 || OPT(cursor_trail_start_threshold_y) > 0) && !ct->needs_render && !ct->window_changed) {
+    if (ct->window_changed) { return false; }
+
+    // With shell integration, do not show the trail for moves in the output of
+    // commands or for the jump to the next prompt after a command finishes.
+    // Only moves are checked, so that a trail already animating, such as one
+    // into a window running a command, is not cut short until the cursor moves
+    // again. It is not kept animating then, as following the moving cursor
+    // would keep it going for as long as the command outputs text.
+    const Screen *s = WD.screen;
+    if (OPT(cursor_trail_only_at_prompt) && ct->target_updated && s->linebuf == s->main_linebuf &&
+        (s->command_state.running || s->command_state.finished_at != ct->command_finished_at)) {
+        return true;
+    }
+
+    if ((OPT(cursor_trail_start_threshold_x) > 0 || OPT(cursor_trail_start_threshold_y) > 0) && !ct->needs_render) {
         int dx = (int)round((ct->corner_x[0] - EDGE(x, 1)) / g.dx);
         int dy = (int)round((ct->corner_y[0] - EDGE(y, 0)) / g.dy);
         if (abs(dx) <= OPT(cursor_trail_start_threshold_x) && abs(dy) <= OPT(cursor_trail_start_threshold_y)) { return true; }
@@ -189,11 +210,20 @@ update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_wi
     if (!WD.screen->paused_rendering.expires_at && OPT(cursor_trail) <= now - WD.screen->cursor->position_changed_by_client_at) {
         update_cursor_trail_target(ct, w, g);
     }
-    if (ct->target_updated && had_prev_edge) ct->cursor_changed_at = now;
 
+    const bool target_updated = ct->target_updated;
     update_cursor_trail_corners(ct, g, now, os_window, w);
-    // update_cursor_trail_corners() clears target_updated for moves too small to start a trail
-    if (ct->target_updated && had_prev_edge) record_cursor_move(ct, now);
+    // Remember which command the cursor last moved after, so the first move
+    // after the next one finishes can be recognized as the jump to the prompt.
+    // If the cursor does not move when a command finishes, the first move at
+    // the prompt is mistaken for that jump, which is rare and harmless.
+    if (target_updated) ct->command_finished_at = WD.screen->command_state.finished_at;
+    // update_cursor_trail_corners() clears target_updated for moves that do not
+    // start a trail, such as small ones or ones in the output of commands
+    if (ct->target_updated && had_prev_edge) {
+        ct->cursor_changed_at = now;
+        record_cursor_move(ct, now);
+    }
     update_cursor_trail_opacity(ct, w, now);
 
     bool needs_render_prev = ct->needs_render;

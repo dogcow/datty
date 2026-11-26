@@ -1,11 +1,14 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2026, Kovid Goyal <kovid at kovidgoyal.net>
 
-from unittest.mock import patch
+from functools import partial
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from datty.fast_data_types import LEFT_EDGE, Color, Region, Screen
-from datty.options.utils import tab_title_wrap
+from datty.fast_data_types import GLFW_MOUSE_BUTTON_LEFT, GLFW_PRESS, GLFW_RELEASE, LEFT_EDGE, Color, Region, Screen
+from datty.options.utils import copy_on_select, tab_title_wrap
 from datty.tab_bar import CellRange, DrawData, ExtraData, TabBar, TabBarData, TabExtent, WindowDropTarget, as_rgb, powerline_symbols, truncate_line, wrap_title
+from datty.tabs import MouseEvents, TabManager
 from datty.utils import color_as_int
 
 from .base import BaseTest
@@ -160,6 +163,113 @@ class TestTabBar(BaseTest):
         self.ae(tb.tab_id_at(60, 90), 3)
         self.ae(tb.tab_id_at(60, 130), 0)
         self.ae(tb.tab_id_at(180, 10), 0)
+
+    def test_tab_bar_selection(self) -> None:
+        tb = self.vertical_tab_bar(3)  # 12x8 cells, tabs on rows 0, 2 and 4
+        self.ae(tb.cell_at(-5, -5), (0, 0, True))
+        self.ae(tb.cell_at(300, 300), (11, 7, False))  # past the end includes the last cell
+        tb.start_selection(1, 50)
+        tb.update_selection(25, 50)
+        with patch('datty.tab_bar.get_boss', return_value=DummyBoss()):
+            tb.update(tb.last_laid_out_tabs)  # erases the screen, the selection must be restored
+        self.ae(tb.finish_selection(), 't1 ')  # strip_trailing_spaces is never by default
+        self.assertFalse(tb.screen.has_selection())
+        # losing focus cancels a selection, as its release may never arrive
+        from datty.boss import Boss
+
+        tb.start_selection(1, 50)
+        tm = SimpleNamespace(tab_bar=tb, active_window=None, active_tab=None, mark_tab_bar_dirty=Mock())
+        Boss.on_focus(SimpleNamespace(os_window_map={1: tm}), 1, False)  # type: ignore
+        self.assertIsNone(tb.selection)
+        self.assertFalse(tb.screen.has_selection())
+        for tab_bar_region in (region(0, 0, 120, 160), region(0, 0, 0, 0)):  # the second hides the tab bar
+            tb.start_selection(1, 50)
+            with (
+                patch('datty.tab_bar.viewport_for_window', return_value=(region(120, 0, 400, 160), tab_bar_region, 400, 160, 10, 20)),
+                patch('datty.tab_bar.set_tab_bar_render_data'),
+            ):
+                tb.layout()
+            self.assertIsNone(tb.selection)
+            self.assertFalse(tb.screen.has_selection())
+
+    def test_tab_bar_selection_mouse_handling(self) -> None:
+        tb = self.vertical_tab_bar(3)
+        s = tb.screen
+        s.cursor.x, s.cursor.y = 0, 7
+        s.draw('cpu 14%')  # text drawn below the tabs, as by a custom tab bar
+        tm = SimpleNamespace(
+            tab_bar=tb,
+            os_window_id=1,
+            recent_tab_bar_mouse_events=MouseEvents(),
+            new_tab=Mock(),
+            active_tab=None,
+            set_active_tab=Mock(),
+            tab_for_id=lambda tab_id: SimpleNamespace(id=tab_id) if tab_id > 0 else None,
+        )
+
+        def mouse(x: float, y: float, action: int = -1) -> None:
+            TabManager.handle_tab_bar_mouse(tm, x, y, -1 if action == -1 else GLFW_MOUSE_BUTTON_LEFT, 0, action)  # type: ignore
+
+        boss = Mock()
+        with (
+            patch('datty.tabs.get_boss', return_value=boss),
+            patch('datty.tabs.get_tab_being_dragged', return_value=(0, False, 0, 0)),
+            patch('datty.tabs.set_tab_being_dragged'),
+        ):
+            # dragging over the text copies it and is not a click
+            mouse(1, 150, GLFW_PRESS)
+            mouse(25, 150)
+            self.assertTrue(s.has_selection())
+            mouse(300, 150)  # past the tab bar, over a window
+            mouse(300, 150, GLFW_RELEASE)
+            boss.copy_selected_text.assert_called_once_with('cpu 14%')
+            self.assertFalse(s.has_selection())
+            self.ae(len(tm.recent_tab_bar_mouse_events), 1)
+            # a double click on an empty area still opens a new tab and copies nothing
+            for action in (GLFW_PRESS, GLFW_RELEASE, GLFW_PRESS, GLFW_RELEASE):
+                mouse(5, 130, action)
+            tm.new_tab.assert_called_once()
+            boss.copy_selected_text.assert_called_once()
+            # a press on a tab starts no selection
+            mouse(5, 10, GLFW_PRESS)
+            self.assertIsNone(tb.selection)
+            mouse(5, 10, GLFW_RELEASE)
+            tm.recent_tab_bar_mouse_events.clear()
+            # jitter within drag_threshold during a double click selects nothing, so it opens a new tab
+            tm.new_tab.reset_mock()
+            for action in (GLFW_PRESS, GLFW_RELEASE, GLFW_PRESS):
+                mouse(3, 150, action)
+            mouse(7, 150)  # into the right half of the cell, selecting it but for drag_threshold
+            self.assertFalse(s.has_selection())
+            mouse(7, 150, GLFW_RELEASE)
+            tm.new_tab.assert_called_once()
+            boss.copy_selected_text.assert_called_once()
+            # a press outside the tab bar, as can reach it during a tab drag, starts no selection
+            mouse(300, 150, GLFW_PRESS)
+            self.assertIsNone(tb.selection)
+            # a press after a lost release cancels the selection left over, copying nothing
+            mouse(1, 150, GLFW_PRESS)
+            mouse(25, 150)
+            self.assertTrue(s.has_selection())
+            mouse(5, 10, GLFW_PRESS)
+            self.assertIsNone(tb.selection)
+            self.assertFalse(s.has_selection())
+            boss.copy_selected_text.assert_called_once()
+
+    def test_copy_selected_text(self) -> None:
+        from datty.boss import Boss
+
+        for value, clipboard_calls, buffers in (('no', 0, {}), ('clipboard', 1, {}), ('a1', 0, {'a1': 'text'})):
+            self.set_options({'copy_on_select': copy_on_select(value)})
+            boss = SimpleNamespace(handle_clipboard_loss=Mock(), clipboard_buffers={})
+            boss.set_clipboard_buffer = partial(Boss.set_clipboard_buffer, boss)
+            boss.copy_text_to_buffer = partial(Boss.copy_text_to_buffer, boss)
+            with patch('datty.boss.set_primary_selection') as primary, patch('datty.boss.set_clipboard_string') as clipboard:
+                Boss.copy_selected_text(boss, 'text')  # type: ignore
+                Boss.copy_selected_text(boss, '')  # type: ignore
+            primary.assert_called_once_with('text')
+            self.ae(clipboard.call_count, clipboard_calls)
+            self.ae(boss.clipboard_buffers, buffers)
 
     def test_vertical_tab_bar_alignment(self) -> None:
         self.set_options(
@@ -360,6 +470,34 @@ class TestTabBar(BaseTest):
         tb = self.vertical_tab_bar(num_tabs=6, height=100, tab_title_template='{title}\\nbr', tab_title_max_lines=2)
         self.ae(self.screen_lines(tb), ['t0', 'br', 't1', 'br', '…'])
         self.ae(tuple(te.y for te in tb.tab_extents), (CellRange(0, 1), CellRange(2, 3)))
+
+    def test_vertical_tab_bar_custom_overflow(self) -> None:
+        def draw_tab(
+            draw_data: DrawData, screen: Screen, tab: TabBarData, before: int, max_tab_length: int, index: int, is_last: bool, extra_data: ExtraData
+        ) -> int:
+            screen.draw(tab.title)
+            end: int = screen.cursor.x
+            if not extra_data.for_layout and extra_data.next_tab is not None and screen.cursor.y + 1 < screen.lines:
+                y, bg = screen.cursor.y, screen.cursor.bg
+                screen.cursor.x, screen.cursor.y = 0, y + 1
+                screen.cursor.bg = as_rgb(0x600000)
+                screen.draw('─' * screen.columns)
+                screen.cursor.x, screen.cursor.y, screen.cursor.bg = end, y, bg
+            # Leave display attributes set, they must not leak into the overflow row
+            c = screen.cursor
+            c.reverse = c.bold = c.italic = c.dim = True
+            c.decoration = 1
+            return end
+
+        background = Color(0, 0, 100)
+        with patch('datty.tab_bar.load_custom_draw_tab', return_value=draw_tab):
+            tb = self.vertical_tab_bar(num_tabs=9, tab_bar_style='custom', tab_bar_background=background)
+        self.ae(self.screen_lines(tb), [f't{i}' for i in range(7)] + ['…'])
+        overflow = tb.screen.line(tb.screen.lines - 1)
+        for x in range(tb.screen.columns):
+            c = overflow.cursor_from(x)
+            self.ae(c.bg, as_rgb(color_as_int(background)), f'x={x}')
+            self.ae((c.reverse, c.bold, c.italic, c.dim, c.decoration), (False, False, False, False, 0), f'x={x}')
 
     def test_wrap_title(self) -> None:
         self.ae(wrap_title('hello world foo', 6).split('\n'), ['hello ', 'world ', 'foo'])

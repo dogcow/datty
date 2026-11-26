@@ -3,6 +3,7 @@
 
 # Imports {{{
 import base64
+import errno
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from functools import partial
 from gettext import gettext as _
 from gettext import ngettext
+from itertools import chain
 from time import sleep
 from typing import (
     TYPE_CHECKING,
@@ -29,7 +31,7 @@ from weakref import WeakValueDictionary
 
 from datty.types import WindowResizeDrag
 
-from .child import cached_process_data, default_env, process_data_cache, set_default_env
+from .child import cached_process_data, default_env, set_default_env
 from .cli import create_opts, green, parse_args
 from .cli_stub import CLIOptions, SaveAsSessionOptions
 from .clipboard import (
@@ -46,7 +48,6 @@ from .config import common_opts_as_dict, prepare_config_file_for_editing, store_
 from .constants import (
     RC_ENCRYPTION_PROTOCOL_VERSION,
     appname,
-    cache_dir,
     clear_handled_signals,
     config_dir,
     handled_signals,
@@ -87,6 +88,7 @@ from .fast_data_types import (
     add_timer,
     apply_options_update,
     background_opacity_of,
+    cancel_bell_attention,
     change_background_opacity,
     change_drag_thumbnail,
     cocoa_hide_app,
@@ -146,6 +148,7 @@ from .fast_data_types import (
 )
 from .key_encoding import get_name_to_functional_number_map
 from .keys import Mappings
+from .launch_wrapper import user_launch_request
 from .layout.base import set_layout_options
 from .notifications import NotificationManager
 from .options.types import Options, nullable_colors
@@ -174,9 +177,7 @@ from .utils import (
     is_ok_to_read_image_file,
     is_ok_to_read_image_path,
     is_path_in_temp_dir,
-    less_version,
     log_error,
-    macos_version,
     open_url,
     parse_address_spec,
     parse_os_window_state,
@@ -254,12 +255,56 @@ class Atexit:
         self._write_line(f'rmtree {path}')
 
 
+def remove_stale_unix_socket(socket_path: str) -> bool:
+    """Remove the UNIX socket at socket_path if no process is listening on
+    it, for example, because the datty that created it was killed. Returns True
+    if the socket was removed."""
+    import stat
+
+    try:
+        if not stat.S_ISSOCK(os.lstat(socket_path).st_mode):
+            return False
+    except FileNotFoundError:
+        return True
+    with socket.socket(socket.AF_UNIX) as probe:
+        try:
+            probe.connect(socket_path)
+        except ConnectionRefusedError:
+            pass  # stale
+        except OSError:
+            return False
+        else:
+            return False  # some process is listening on it
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
+    return True
+
+
 def listen_on(spec: str, robust_atexit: Atexit) -> tuple[int, str]:
     import socket
 
     family, address, socket_path = parse_address_spec(spec)
     s = socket.socket(family)
-    s.bind(address)
+    try:
+        s.bind(address)
+    except OSError as err:
+        if err.errno != errno.EADDRINUSE or not socket_path:
+            s.close()
+            raise
+        if not remove_stale_unix_socket(socket_path):
+            s.close()
+            import stat
+
+            try:
+                is_socket = stat.S_ISSOCK(os.lstat(socket_path).st_mode)
+            except OSError:
+                is_socket = False
+            if is_socket:
+                raise OSError(err.errno, f'Another process is already listening on {socket_path}') from err
+            raise OSError(err.errno, f'A file that is not a socket already exists at {socket_path}') from err
+        s.bind(address)
     if family == socket.AF_UNIX and socket_path:
         robust_atexit.unlink(socket_path)
     s.listen()
@@ -466,8 +511,8 @@ class Boss:
         if args.listen_on and self.allow_remote_control in ('y', 'socket', 'socket-only', 'password'):
             try:
                 listen_fd, self.listening_on = listen_on(args.listen_on, self.atexit)
-            except Exception:
-                self.misc_config_errors.append(f'Invalid listen_on={args.listen_on}, ignoring')
+            except Exception as err:
+                self.misc_config_errors.append(f'Failed to listen on listen_on={args.listen_on} with error: {err}, ignoring')
                 log_error(self.misc_config_errors[-1])
         self.child_monitor: ChildMonitor = ChildMonitor(
             self.on_child_death,
@@ -762,7 +807,7 @@ class Boss:
             sw: SpecialWindowInstance | None = args
         else:
             args = tuple(args)
-            sw = self.args_to_special_window(args, cwd_from) if args else None
+            sw = self.args_to_special_window(args, cwd_from, launch_type='os-window') if args else None
         startup_session = next(create_sessions(get_options(), special_window=sw, cwd_from=cwd_from))
         startup_session.session_name = ''
         ans = self.add_os_window(startup_session)
@@ -801,7 +846,7 @@ class Boss:
         if isinstance(wd, str):
             wd = wd.split(os.pathsep) if str_is_multiple_paths else [wd]
         for path in wd:
-            special_window = SpecialWindow(None, cwd=path)
+            special_window = SpecialWindow(None, cwd=path, launch_request=user_launch_request('os-window'))
             self._new_os_window(special_window)
 
     def add_child(self, window: Window) -> None:
@@ -1008,8 +1053,16 @@ class Boss:
 
         try:
             if isinstance(payload, types.GeneratorType):
-                for x in payload:
-                    c.response_from_datty(self, self_window, PayloadGetter(c, x if isinstance(x, dict) else {}))
+                stream_id = ''
+                try:
+                    for x in payload:
+                        pd = x if isinstance(x, dict) else {}
+                        stream_id = str(pd.get('stream_id') or stream_id)
+                        c.response_from_datty(self, self_window, PayloadGetter(c, pd))
+                finally:
+                    # Drop data already received if the stream did not complete
+                    if stream_id:
+                        c.stream_in_flight.discard(stream_id)
                 return None
             pd = cast(dict[str, Any], payload if isinstance(payload, dict) else {})
             return c.response_from_datty(self, self_window, PayloadGetter(c, pd))
@@ -1208,6 +1261,8 @@ class Boss:
             if tab is not None:
                 tab.remove_window(window)
                 self._cleanup_tab_after_window_removal(tab)
+            if window.needs_attention:
+                self.cancel_bell_attention_if_idle((os_window_id,))
             for removal_action in window.actions_on_removal:
                 try:
                     removal_action(window)
@@ -1449,6 +1504,7 @@ class Boss:
         window: Window | None = None,  # the window associated with the confirmation
         prompt: str = '> ',
         initial_value: str = '',
+        cwd: str = '',  # the directory relative to which file names are completed
     ) -> None:
         result: str = ''
 
@@ -1463,7 +1519,13 @@ class Boss:
         if initial_value:
             cmd.append('--default=' + initial_value)
         self.run_daddy_with_metadata(
-            'ask', cmd, window=window, custom_callback=callback_, default_data={'response': ''}, action_on_removal=on_popup_overlay_removal
+            'ask',
+            cmd,
+            window=window,
+            custom_callback=callback_,
+            default_data={'response': ''},
+            action_on_removal=on_popup_overlay_removal,
+            cwd=cwd,
         )
 
     def _windows_closed_with_tab(self, tab: Tab) -> tuple[Window, ...]:
@@ -2100,7 +2162,7 @@ class Boss:
 
         if key_action is not None:
             f = getattr(self, key_action.func, None)
-            if f is not None:
+            if callable(f):
                 orig, self.window_for_dispatch = self.window_for_dispatch, window_for_dispatch
                 try:
                     report_match(f)
@@ -2118,7 +2180,8 @@ class Boss:
         if tab is None or window is None:
             return False
         if key_action is not None:
-            f = getattr(tab, key_action.func, getattr(window, key_action.func, None))
+            # Only call methods, not data attributes that happen to share the action's name
+            f = next((x for x in (getattr(tab, key_action.func, None), getattr(window, key_action.func, None)) if callable(x)), None)
             if f is not None:
                 passthrough = f(*key_action.args)
                 report_match(f)
@@ -2174,9 +2237,15 @@ class Boss:
     def on_focus(self, os_window_id: int, focused: bool) -> None:
         tm = self.os_window_map.get(os_window_id)
         if tm is not None:
+            if not focused:  # the release that would end a selection in the tab bar may never arrive
+                tm.tab_bar.cancel_selection()
             w = tm.active_window
             if w is not None:
                 w.focus_changed(focused)
+                if focused:
+                    # focus_changed() is a no-op if the window became active while
+                    # the OS window was unfocused, so clear the bell indicator here as well
+                    w.clear_needs_attention()
                 if is_macos and focused:
                     cocoa_set_menubar_title(w.title or '')
             tm.mark_tab_bar_dirty()
@@ -2191,13 +2260,6 @@ class Boss:
         tm = self.os_window_map.get(os_window_id)
         if tm is not None:
             tm.mark_tab_bar_dirty()
-
-    def cache_process_data(self, enable: bool) -> None:
-        "Turn on caching of process data. Must be called in enable/disable pairs."
-        if enable:
-            self.process_data_cache_active = process_data_cache.start_caching()
-        else:
-            process_data_cache.stop_caching(self.process_data_cache_active)
 
     def update_tab_bar_data(self, os_window_id: int) -> None:
         tm = self.os_window_map.get(os_window_id)
@@ -2696,15 +2758,6 @@ class Boss:
         tab = self.active_tab
         if tab is not None:
             bdata = data.encode('utf-8') if isinstance(data, str) else data
-            if is_macos and cmd[0] == '/usr/bin/less' and macos_version()[:2] < (12, 3):
-                # the system less before macOS 12.3 barfs up OSC codes, so sanitize them ourselves
-                sentinel = os.path.join(cache_dir(), 'less-is-new-enough')
-                if not os.path.exists(sentinel):
-                    if less_version(cmd[0]) >= 581:
-                        open(sentinel, 'w').close()
-                    else:
-                        bdata = re.sub(rb'\x1b\].*?\x1b\\', b'', bdata)
-
             return tab.new_special_window(
                 SpecialWindow(cmd, bdata, title or _('History'), overlay_for=window.id, cwd=window.cwd_of_child), copy_colors_from=self.active_window
             )
@@ -2718,13 +2771,13 @@ class Boss:
     def edit_file(self, path: str) -> None:
         editor_cmd = get_editor(get_options())
         exe = editor_cmd[0]
+        path = os.path.abspath(os.path.expanduser(path))
         if not os.path.isabs(exe):
             exe = which(exe) or ''
-            if not exe or not os.access(exe, os.X_OK):
-                self.show_error(_('Cannot find editor'), _('Could not edit the file {0} because the editor {1} was not found.').format(editor_cmd[0]))
-                return
-            editor_cmd[0] = exe
-        path = os.path.abspath(os.path.expanduser(path))
+        if not exe or not os.access(exe, os.X_OK):
+            self.show_error(_('Cannot find editor'), _('Could not edit the file {0} because the editor {1} was not found.').format(path, editor_cmd[0]))
+            return
+        editor_cmd[0] = exe
         self.new_os_window(*editor_cmd, path)
 
     def run_daddy_with_metadata(
@@ -2736,6 +2789,7 @@ class Boss:
         custom_callback: Callable[[dict[str, Any], int, 'Boss'], None] | None = None,
         action_on_removal: Callable[[int, 'Boss'], None] | None = None,
         default_data: dict[str, Any] | None = None,
+        cwd: str = '',
     ) -> Any:
         from daddies.runner import CLIOnlyDaddy, DaddyMetadata, create_daddy_handler, resolved_daddy
 
@@ -2833,7 +2887,7 @@ class Boss:
                         cmd + args,
                         stdin=data,
                         env=env,
-                        cwd=CwdRequest(w).cwd_of_child or w.cwd_of_child,
+                        cwd=cwd or CwdRequest(w).cwd_of_child or w.cwd_of_child,
                         overlay_for=w.id,
                         overlay_behind=end_daddy.has_ready_notification,
                     ),
@@ -3189,7 +3243,7 @@ class Boss:
         def callback(timer_id: int | None) -> None:
             self.dispatch_action(actions.pop(0), window_for_dispatch, dispatch_type)
             if actions:
-                self.drain_actions(actions)
+                self.drain_actions(actions, window_for_dispatch, dispatch_type)
 
         add_timer(callback, 0, False)
 
@@ -3239,12 +3293,19 @@ class Boss:
     def set_primary_selection(self) -> None:
         w = self.active_window
         if w is not None and not w.destroyed:
-            text = w.text_for_selection()
-            if text:
-                set_primary_selection(text)
-                self.handle_clipboard_loss('primary', w.id)
-                if get_options().copy_on_select:
-                    self.copy_to_buffer(get_options().copy_on_select)
+            self.copy_selected_text(w.text_for_selection(), w.id)
+
+    def cancel_tab_bar_selection(self, os_window_id: int) -> None:
+        if (tm := self.os_window_map.get(os_window_id)) is not None:
+            tm.tab_bar.cancel_selection()
+
+    def copy_selected_text(self, text: str, source_window_id: int = 0) -> None:
+        "Make text that was just selected the primary selection and copy it as per copy_on_select"
+        if text:
+            set_primary_selection(text)
+            self.handle_clipboard_loss('primary', source_window_id)
+            if get_options().copy_on_select:
+                self.copy_text_to_buffer(text, get_options().copy_on_select, source_window_id)
 
     def get_active_selection(self) -> str | None:
         w = self.active_window
@@ -3279,16 +3340,18 @@ class Boss:
     def copy_to_buffer(self, buffer_name: str) -> None:
         w = self.window_for_dispatch or self.active_window
         if w is not None and not w.destroyed:
-            text = w.text_for_selection()
-            if text:
-                if buffer_name == 'clipboard':
-                    set_clipboard_string(text)
-                    self.handle_clipboard_loss('clipboard', w.id)
-                elif buffer_name == 'primary':
-                    set_primary_selection(text)
-                    self.handle_clipboard_loss('primary', w.id)
-                else:
-                    self.set_clipboard_buffer(buffer_name, text)
+            self.copy_text_to_buffer(w.text_for_selection(), buffer_name, w.id)
+
+    def copy_text_to_buffer(self, text: str, buffer_name: str, source_window_id: int = 0) -> None:
+        if text:
+            if buffer_name == 'clipboard':
+                set_clipboard_string(text)
+                self.handle_clipboard_loss('clipboard', source_window_id)
+            elif buffer_name == 'primary':
+                set_primary_selection(text)
+                self.handle_clipboard_loss('primary', source_window_id)
+            else:
+                self.set_clipboard_buffer(buffer_name, text)
 
     @ac(
         'cp',
@@ -3535,7 +3598,7 @@ class Boss:
             self.run_background_process(cmd, cwd_from=cwd_from, stdin=stdin, env=env)
         return None
 
-    def args_to_special_window(self, args: Iterable[str], cwd_from: CwdRequest | None = None) -> SpecialWindowInstance:
+    def args_to_special_window(self, args: Iterable[str], cwd_from: CwdRequest | None = None, launch_type: str = 'window') -> SpecialWindowInstance:
         args = list(args)
         stdin = None
         w = self.active_window
@@ -3554,7 +3617,7 @@ class Boss:
                     continue
                 arg = q
             cmd.append(arg)
-        return SpecialWindow(cmd, stdin, cwd_from=cwd_from)
+        return SpecialWindow(cmd, stdin, cwd_from=cwd_from, launch_request=user_launch_request(launch_type, cwd_from))
 
     def _new_tab(self, args: SpecialWindowInstance | Iterable[str], cwd_from: CwdRequest | None = None, as_neighbor: bool = False) -> Tab | None:
         special_window = None
@@ -3563,7 +3626,7 @@ class Boss:
         else:
             args = tuple(args)
             if args:
-                special_window = self.args_to_special_window(args, cwd_from=cwd_from)
+                special_window = self.args_to_special_window(args, cwd_from=cwd_from, launch_type='tab')
         if not self.os_window_map:
             self.add_os_window()
         tm = self.active_tab_manager
@@ -3636,7 +3699,7 @@ class Boss:
         if isinstance(wd, str):
             wd = wd.split(os.pathsep) if str_is_multiple_paths else [wd]
         for path in wd:
-            special_window = SpecialWindow(None, cwd=path)
+            special_window = SpecialWindow(None, cwd=path, launch_request=user_launch_request('tab'))
             self._new_tab(special_window)
 
     def _new_window(self, args: list[str], cwd_from: CwdRequest | None = None) -> Window | None:
@@ -3659,7 +3722,9 @@ class Boss:
         if args:
             w = tab.new_special_window(self.args_to_special_window(args, cwd_from=cwd_from), location=location, allow_remote_control=allow_remote_control)
         else:
-            w = tab.new_window(cwd_from=cwd_from, location=location, allow_remote_control=allow_remote_control)
+            w = tab.new_window(
+                cwd_from=cwd_from, location=location, allow_remote_control=allow_remote_control, launch_request=user_launch_request('window', cwd_from)
+            )
         if cwd_from is not None and (sw := cwd_from.window):
             w.created_in_session_name = sw.effective_session_name
         return w
@@ -3815,6 +3880,10 @@ class Boss:
         from .fonts.render import clear_font_caches
 
         clear_font_caches()
+        # must be cleared before apply_new_options() as that redraws the window title bars
+        from .window_title_bar import clear_caches
+
+        clear_caches()
         self.apply_new_options(opts)
         from .open_actions import clear_caches
 
@@ -3828,6 +3897,10 @@ class Boss:
         clear_caches()
 
         from .shaders.slang import clear_caches
+
+        clear_caches()
+
+        from .launch_wrapper import clear_caches
 
         clear_caches()
 
@@ -3894,12 +3967,22 @@ class Boss:
             if file:
                 a(f'In file {file}:')
             [a(format_bad_line(x)) for x in groups[file]]
+        # misc_errors are errors that happen during startup that are not
+        # caused by invalid lines in the config, such as failing to listen on
+        # the remote control socket
         if misc_errors := tuple(misc_errors):
-            a('In final effective configuration:')
+            if groups:
+                a('Other errors:')
             for line in misc_errors:
                 a(line)
         msg = '\n'.join(ans).rstrip()
-        self.show_error(_('Errors parsing configuration'), msg)
+        if groups and misc_errors:
+            title = _('Errors parsing configuration and during startup')
+        elif misc_errors:
+            title = _('Errors during startup')
+        else:
+            title = _('Errors parsing configuration')
+        self.show_error(title, msg)
 
     @ac(
         'misc',
@@ -4032,6 +4115,60 @@ class Boss:
         target_tab.make_active()
         return target_tab
 
+    def _set_session_of(self, session_name: str, windows: Iterable[Window] = (), tabs: Iterable[Tab] = ()) -> None:
+        """
+        Change the session the specified windows and tabs belong to, in place. A tab is moved
+        along with all its windows, including the docks of the tab. A window is moved along with
+        its overlays and the docks attached to it. Its tab, with the docks of the tab, is moved
+        too if every other window in the tab is already in the target session, so that, for
+        example, a window alone in its tab moves completely and a window moved to no session
+        does not keep belonging to the session of its tab. The docks of the OS Window merely
+        follow its active tab and are never moved. An OS Window is moved when all its tabs are.
+        """
+        whole_tabs = dict.fromkeys(tabs)
+        matched: dict[Window, None] = {}
+        for w in windows:
+            if (tab := w.tabref()) is None or tab in whole_tabs:
+                continue
+            if (group := tab.windows.group_for_window(w)) is not None:
+                matched.update(dict.fromkeys(group))
+                if group.dock is None:
+                    for dock in group.docks:
+                        matched.update(dict.fromkeys(dock))
+            else:
+                matched[w] = None
+
+        def windows_of_tab_docks(tab: Tab) -> Iterator[Window]:
+            wl = tab.windows
+            for g in chain(wl.tab_docks, wl.orphaned_docks):
+                yield from g
+
+        # Decided before any change, as windows of no session belong to the session of their tab
+        tabs_of_matched = dict.fromkeys(tab for w in matched if (tab := w.tabref()) is not None)
+        relabeled_tabs: list[Tab] = []
+        for tab in tabs_of_matched:
+            excluded = set(chain(windows_of_tab_docks(tab), tab.windows.iter_os_window_dock_windows()))
+            if all(w.effective_session_name == session_name for w in tab if w not in matched and w not in excluded):
+                relabeled_tabs.append(tab)
+        for w in matched:
+            w.created_in_session_name = session_name
+        for tab in whole_tabs:
+            for w in tab:
+                if not tab.windows.is_in_os_window_dock(w):
+                    w.created_in_session_name = session_name
+        for tab in relabeled_tabs:
+            for w in windows_of_tab_docks(tab):
+                w.created_in_session_name = session_name
+        for tab in chain(whole_tabs, relabeled_tabs):
+            tab.created_in_session_name = session_name
+        for tm in dict.fromkeys(tm for tab in chain(whole_tabs, tabs_of_matched) if (tm := tab.tab_manager_ref()) is not None):
+            if all(t.created_in_session_name == session_name for t in tm):
+                tm.created_in_session_name = session_name
+        # The active session, used by tab_bar_filter, may have changed, so refresh all tab bars
+        for tm in self.all_tab_managers:
+            tm.update_tab_bar_data()
+            tm.mark_tab_bar_dirty()
+
     def choose_entry[_T](
         self,
         title: str,
@@ -4093,6 +4230,25 @@ class Boss:
     )
     def close_session(self, *cmdline: str) -> None:
         close_session_with_confirm(self, cmdline)
+
+    @ac(
+        'session',
+        """
+        Change the session the active window belongs to.
+        Accepts the same arguments as :ref:`daddy @ set-session <at-set-session>`,
+        so it can be used for tabs and other windows as well. See :ref:`moving_to_session` for details.
+
+        Examples::
+            # Move the active window to the session named work
+            map f1 set_session work
+            # Move the active tab and all its windows to the session named work
+            map f2 set_session --match-tab=state:active work
+            # Remove the active window from its session
+            map f3 set_session !
+    """,
+    )
+    def set_session(self, *args: str) -> None:
+        self.remote_control('set-session', *args)
 
     @ac('tab', 'Interactively select a tab to switch to')
     def select_tab(self) -> None:
@@ -4372,6 +4528,50 @@ class Boss:
         tm = self.active_tab_manager_with_dispatch
         if tm is not None:
             tm.toggle_tab(match_expression)
+
+    @ac(
+        'win',
+        """
+        Clear the bell indicators of windows
+
+        Clears the visual indicators of a rung bell, such as :opt:`bell_border_color`
+        and :opt:`bell_on_tab`, without needing to focus the windows that rang
+        the bell. By default, clears them for all windows. Optionally, specify
+        an expression to only clear them for matching windows. See
+        :ref:`search_syntax` for details on the match expression.
+
+        The system attention request from :opt:`window_alert_on_bell` is
+        dismissed once all bell indicators in its OS window have been cleared.
+        Not supported on Wayland, where such requests cannot be withdrawn.
+
+        For example::
+
+            # Clear bell indicators in all windows
+            map f1 clear_bell_indicators
+            # Clear bell indicators only in the windows of the currently active tab
+            map f2 clear_bell_indicators state:parent_focused
+            # Clear bell indicators only in the windows of the focused OS window
+            map f3 clear_bell_indicators state:focused_os_window
+        """,
+    )
+    def clear_bell_indicators(self, match_expression: str = '') -> None:
+        if match_expression:
+            try:
+                windows = list(self.match_windows(match_expression, self.window_for_dispatch or self.active_window))
+            except Exception as e:
+                self.show_error(_('Invalid match expression'), f'{match_expression}\n{e}')
+                return
+        else:
+            windows = list(self.all_windows)
+        for w in windows:
+            w.clear_needs_attention()
+        self.cancel_bell_attention_if_idle({w.os_window_id for w in windows})
+
+    def cancel_bell_attention_if_idle(self, os_window_ids: Iterable[int]) -> None:
+        """Cancel the system attention request of the specified OS windows, if none of their windows need attention"""
+        pending = {w.os_window_id for w in self.all_windows if w.needs_attention}
+        for os_window_id in set(os_window_ids) - pending:
+            cancel_bell_attention(os_window_id)
 
     def update_progress_in_dock(self) -> None:
         if not is_macos:
