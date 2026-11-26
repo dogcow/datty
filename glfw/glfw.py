@@ -100,6 +100,7 @@ def generate_wrappers(glfw_header: str) -> None:
     void glfwCocoaSetWindowLevel(GLFWwindow *window, const char *level_spec)
     void glfwCocoaAddWindowToTabGroup(GLFWwindow *parent, GLFWwindow *child)
     int glfwCocoaCycleTabs(GLFWwindow *window, int delta)
+    int glfwCocoaTabBarHeight(GLFWwindow *window)
     void glfwCocoaSetNewTabCallback(GLFWcocoanewtabfun callback)
     const char* glfwGetPrimarySelectionString(GLFWwindow* window, void)
     int glfwGetNativeKeyForName(const char* key_name, int case_sensitive)

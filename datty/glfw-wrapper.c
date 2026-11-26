@@ -527,6 +527,9 @@ load_glfw(const char* path) {
     *(void **) (&glfwCocoaCycleTabs_impl) = dlsym(handle, "glfwCocoaCycleTabs");
     if (glfwCocoaCycleTabs_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwCocoaTabBarHeight_impl) = dlsym(handle, "glfwCocoaTabBarHeight");
+    if (glfwCocoaTabBarHeight_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwCocoaSetNewTabCallback_impl) = dlsym(handle, "glfwCocoaSetNewTabCallback");
     if (glfwCocoaSetNewTabCallback_impl == NULL) dlerror(); // clear error indicator
 

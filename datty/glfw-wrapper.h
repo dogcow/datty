@@ -2633,6 +2633,10 @@ typedef int (*glfwCocoaCycleTabs_func)(GLFWwindow*, int);
 GFW_EXTERN glfwCocoaCycleTabs_func glfwCocoaCycleTabs_impl;
 #define glfwCocoaCycleTabs glfwCocoaCycleTabs_impl
 
+typedef int (*glfwCocoaTabBarHeight_func)(GLFWwindow*);
+GFW_EXTERN glfwCocoaTabBarHeight_func glfwCocoaTabBarHeight_impl;
+#define glfwCocoaTabBarHeight glfwCocoaTabBarHeight_impl
+
 typedef void (*glfwCocoaSetNewTabCallback_func)(GLFWcocoanewtabfun);
 GFW_EXTERN glfwCocoaSetNewTabCallback_func glfwCocoaSetNewTabCallback_impl;
 #define glfwCocoaSetNewTabCallback glfwCocoaSetNewTabCallback_impl
