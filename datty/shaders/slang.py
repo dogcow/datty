@@ -36,6 +36,7 @@ from datty.fast_data_types import (
     COLOR_IS_RGB,
     COLOR_IS_SPECIAL,
     COLOR_NOT_SET,
+    CONCEAL,
     CUSTOM_END_PROGRAM,
     DECORATION,
     DECORATION_MASK,
@@ -750,6 +751,7 @@ class SlangFile(NamedTuple):
                 ans['STRIKE_SHIFT'] = str(STRIKETHROUGH)
                 ans['DIM_SHIFT'] = str(DIM)
                 ans['BLINK_SHIFT'] = str(BLINK)
+                ans['CONCEAL_SHIFT'] = str(CONCEAL)
                 ans['DECORATION_SHIFT'] = str(DECORATION)
                 ans['MARK_SHIFT'] = str(MARK)
                 ans['DECORATION_MASK'] = str(DECORATION_MASK)

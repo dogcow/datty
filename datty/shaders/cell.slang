@@ -31,7 +31,11 @@ static const uint SPRITE_COLORED_SHIFT = 31u;
 // Set in underline_exclusion_pos when the glyph, decorations, and cursor sprite
 // are all 0. The block cursor is sprite 0 and its color is already in the
 // background. Packed into an existing flat varying to not use another slot.
+// Bit 30 hides the glyph for ECMA-48 conceal. Underline, strike, and the
+// cursor still draw. Mask both flags before using the value as a texel row.
 static const uint SKIP_TEXT_FLAG = 0x80000000u;
+static const uint CONCEAL_GLYPH_FLAG = 0x40000000u;
+static const uint UNDERLINE_POS_MASK = ~(SKIP_TEXT_FLAG | CONCEAL_GLYPH_FLAG);
 
 struct VertexOutput {
     float4 position : SV_Position;
@@ -191,7 +195,8 @@ vertex_main(
         uint cursor_sprite = cell_data.cursor_fg_sprite_idx * uint(cell_data.has_cursor);
         vo.cursor_pos = to_sprite_pos(cell_data.pos, cursor_sprite);
         uint skip_text = uint((sprite_idx[0] & SPRITE_INDEX_MASK) == 0u && decs[0] == 0u && decs[1] == 0u && cursor_sprite == 0u);
-        vo.underline_exclusion_pos = to_underline_exclusion_pos(sprite_idx) | (skip_text * SKIP_TEXT_FLAG);
+        uint concealed = ((text_attrs >> CONCEAL_SHIFT) & BIT_MASK) * (1u - (is_selected & BIT_MASK));
+        vo.underline_exclusion_pos = to_underline_exclusion_pos(sprite_idx) | (skip_text * SKIP_TEXT_FLAG) | (concealed * CONCEAL_GLYPH_FLAG);
     }
     // }}}
 
@@ -285,7 +290,7 @@ calculate_premul_foreground_from_sprites(
     float3 sz = float3(float(width), float(height), float(layer));
 
     float underline_alpha = sprites.SampleLevel(underline_pos, 0).w;
-    int3 fetch_coord = int3(int(sprite_pos.x * sz.x), int(underline_exclusion_pos), int(sprite_pos.z));
+    int3 fetch_coord = int3(int(sprite_pos.x * sz.x), int(underline_exclusion_pos & UNDERLINE_POS_MASK), int(sprite_pos.z));
     float underline_exclusion = sprites[fetch_coord].w;
 
     underline_alpha *= 1.0 - underline_exclusion;
@@ -318,6 +323,7 @@ fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_g
         // blend in the foreground color
         float4 text_fg = load_text_foreground_color(vo.sprite_pos, vo.colored_sprite, vo.cell_foreground);
         text_fg = adjust_foreground_contrast_with_background(text_fg, vo.background, text_contrast, text_gamma_adjustment);
+        if ((vo.underline_exclusion_pos & CONCEAL_GLYPH_FLAG) != 0u) text_fg.w = 0.0;
         float4 text_fg_premul = calculate_premul_foreground_from_sprites(
             vo.sprite_pos,
             vo.underline_pos,

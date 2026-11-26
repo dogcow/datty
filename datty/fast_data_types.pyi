@@ -1133,6 +1133,7 @@ class Cursor:
     italic: bool
     blink: bool
     text_blink: bool
+    conceal: bool
     shape: int
 
 class ImageLayerRect(TypedDict):
