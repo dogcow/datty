@@ -34,6 +34,12 @@
 #endif
 
 #define arraysz(x) (sizeof(x) / sizeof(x[0]))
+// The largest plausible age, in seconds, of an input event from the system when
+// it is processed. Event times that are older than this, or in the future, are
+// taken to be on a different clock, and the event to have happened now. It is
+// large so that events delivered late, because the event loop was blocked, keep
+// their times.
+#define MAX_INPUT_EVENT_AGE_SECONDS 30
 #define MAX(x, y)              \
     __extension__({            \
         __typeof__(x) a = (x); \
@@ -49,8 +55,6 @@
 
 #define GLFW_INCLUDE_NONE
 #include "glfw3.h"
-
-#define EGL_PRESENT_OPAQUE_EXT 0x31df
 
 #define GLFW_MOD_REMAP_SZ 8
 #define _GLFW_INSERT_FIRST 0
@@ -68,9 +72,7 @@ typedef unsigned long long GLFWid;
 typedef struct _GLFWerror _GLFWerror;
 typedef struct _GLFWinitconfig _GLFWinitconfig;
 typedef struct _GLFWwndconfig _GLFWwndconfig;
-typedef struct _GLFWctxconfig _GLFWctxconfig;
 typedef struct _GLFWfbconfig _GLFWfbconfig;
-typedef struct _GLFWcontext _GLFWcontext;
 typedef struct _GLFWwindow _GLFWwindow;
 typedef struct _GLFWlibrary _GLFWlibrary;
 typedef struct _GLFWmonitor _GLFWmonitor;
@@ -81,31 +83,6 @@ typedef struct _GLFWjoystick _GLFWjoystick;
 typedef struct _GLFWtls _GLFWtls;
 typedef struct _GLFWmutex _GLFWmutex;
 
-typedef void (*_GLFWmakecontextcurrentfun)(_GLFWwindow *);
-typedef void (*_GLFWswapbuffersfun)(_GLFWwindow *);
-typedef void (*_GLFWswapintervalfun)(int);
-typedef int (*_GLFWextensionsupportedfun)(const char *);
-typedef GLFWglproc (*_GLFWgetprocaddressfun)(const char *);
-typedef void (*_GLFWdestroycontextfun)(_GLFWwindow *);
-
-#define GL_VERSION 0x1F02
-#define GL_NONE 0
-#define GL_COLOR_BUFFER_BIT 0x00004000
-#define GL_UNSIGNED_BYTE 0x1401
-#define GL_EXTENSIONS 0x1F03
-#define GL_NUM_EXTENSIONS 0x821d
-#define GL_CONTEXT_FLAGS 0x821e
-#define GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT 0x00000001
-#define GL_CONTEXT_FLAG_DEBUG_BIT 0x00000002
-#define GL_CONTEXT_PROFILE_MASK 0x9126
-#define GL_CONTEXT_COMPATIBILITY_PROFILE_BIT 0x00000002
-#define GL_CONTEXT_CORE_PROFILE_BIT 0x00000001
-#define GL_RESET_NOTIFICATION_STRATEGY_ARB 0x8256
-#define GL_LOSE_CONTEXT_ON_RESET_ARB 0x8252
-#define GL_NO_RESET_NOTIFICATION_ARB 0x8261
-#define GL_CONTEXT_RELEASE_BEHAVIOR 0x82fb
-#define GL_CONTEXT_RELEASE_BEHAVIOR_FLUSH 0x82fc
-#define GL_CONTEXT_FLAG_NO_ERROR_BIT_KHR 0x00000008
 
 #define MAX(x, y)              \
     __extension__({            \
@@ -119,17 +96,6 @@ typedef void (*_GLFWdestroycontextfun)(_GLFWwindow *);
         __typeof__(y) b = (y); \
         a < b ? a : b;         \
     })
-
-typedef int GLint;
-typedef unsigned int GLuint;
-typedef unsigned int GLenum;
-typedef unsigned int GLbitfield;
-typedef unsigned char GLubyte;
-
-typedef void(APIENTRY *PFNGLCLEARPROC)(GLbitfield);
-typedef const GLubyte *(APIENTRY *PFNGLGETSTRINGPROC)(GLenum);
-typedef void(APIENTRY *PFNGLGETINTEGERVPROC)(GLenum, GLint *);
-typedef const GLubyte *(APIENTRY *PFNGLGETSTRINGIPROC)(GLenum, GLuint);
 
 #define VK_NULL_HANDLE 0
 
@@ -203,14 +169,10 @@ typedef VkResult(APIENTRY *PFN_vkEnumerateInstanceExtensionProperties)(const cha
 #include "x11_platform.h"
 #elif defined(_GLFW_WAYLAND)
 #include "wl_platform.h"
-#elif defined(_GLFW_OSMESA)
-#include "null_platform.h"
 #else
 #error "No supported window creation API selected"
 #endif
 
-#include "egl_context.h"
-#include "osmesa_context.h"
 
 #define remove_i_from_array(array, i, count)                                                                                                             \
     {                                                                                                                                                    \
@@ -280,7 +242,6 @@ struct _GLFWerror {
 //
 struct _GLFWinitconfig {
     bool hatButtons;
-    int angleType;
     bool debugKeyboard;
     bool debugRendering;
     struct {
@@ -322,6 +283,8 @@ struct _GLFWwndconfig {
     struct {
         char className[256];
         char instanceName[256];
+        // The visual to use for the window, chosen by the GPU driver, zero for the default
+        unsigned long visualID;
     } x11;
     struct {
         char appId[256], windowTag[256];
@@ -329,88 +292,13 @@ struct _GLFWwndconfig {
     } wl;
 };
 
-// Context configuration
-//
-// Parameters relating to the creation of the context but not directly related
-// to the framebuffer.  This is used to pass context creation parameters from
-// shared code to the platform API.
-//
-struct _GLFWctxconfig {
-    int client;
-    int source;
-    int major;
-    int minor;
-    bool forward;
-    bool debug;
-    bool noerror;
-    int profile;
-    int robustness;
-    int release;
-    _GLFWwindow *share;
-    struct {
-        bool offline;
-    } nsgl;
-};
-
 // Framebuffer configuration
 //
-// This describes buffers and their sizes.  It also contains
-// a platform-specific ID used to map back to the backend API object.
-//
-// It is used to pass framebuffer parameters from shared code to the platform
-// API and also to enumerate and select available framebuffer configs.
-//
 struct _GLFWfbconfig {
-    int redBits;
-    int greenBits;
-    int blueBits;
-    int alphaBits;
-    int depthBits;
-    int stencilBits;
-    int accumRedBits;
-    int accumGreenBits;
-    int accumBlueBits;
-    int accumAlphaBits;
-    int auxBuffers;
-    bool stereo;
-    int samples;
-    bool sRGB;
-    bool doublebuffer;
     bool transparent;
-    uintptr_t handle;
 };
 
-// Context structure
-//
-struct _GLFWcontext {
-    int client;
-    int source;
-    int major, minor, revision;
-    bool forward, debug, noerror;
-    int profile;
-    int robustness;
-    int release;
-
-    PFNGLGETSTRINGIPROC GetStringi;
-    PFNGLGETINTEGERVPROC GetIntegerv;
-    PFNGLGETSTRINGPROC GetString;
-
-    _GLFWmakecontextcurrentfun makeCurrent;
-    _GLFWswapbuffersfun swapBuffers;
-    _GLFWswapintervalfun swapInterval;
-    _GLFWextensionsupportedfun extensionSupported;
-    _GLFWgetprocaddressfun getProcAddress;
-    _GLFWdestroycontextfun destroy;
-
-    // This is defined in the context API's context.h
-    _GLFW_PLATFORM_CONTEXT_STATE
-    // This is defined in egl_context.h
-    _GLFWcontextEGL egl;
-    // This is defined in osmesa_context.h
-    _GLFWcontextOSMesa osmesa;
-};
-
-// Window and context structure
+// Window structure
 //
 struct _GLFWwindow {
     struct _GLFWwindow *next;
@@ -444,7 +332,6 @@ struct _GLFWwindow {
     double virtualCursorPosX, virtualCursorPosY;
     bool rawMouseMotion;
 
-    _GLFWcontext context;
 #ifdef _GLFW_WAYLAND
     bool swaps_disallowed;
 #else
@@ -465,6 +352,7 @@ struct _GLFWwindow {
         GLFWwindowiconifyfun iconify;
         GLFWwindowmaximizefun maximize;
         GLFWframebuffersizefun fbsize;
+        GLFWnativesurfacechangedfun native_surface_changed;
         GLFWwindowcontentscalefun scale;
         GLFWmousebuttonfun mouseButton;
         GLFWcursorposfun cursorPos;
@@ -581,7 +469,6 @@ struct _GLFWlibrary {
         _GLFWinitconfig init;
         _GLFWfbconfig framebuffer;
         _GLFWwndconfig window;
-        _GLFWctxconfig context;
         int refreshRate;
     } hints;
 
@@ -601,7 +488,6 @@ struct _GLFWlibrary {
     int mappingCount;
 
     _GLFWtls errorSlot;
-    _GLFWtls contextSlot;
     _GLFWmutex errorLock;
 
     bool ignoreOSKeyboardProcessing, keyboard_grabbed;
@@ -647,14 +533,8 @@ struct _GLFWlibrary {
 
     // This is defined in the window API's platform.h
     _GLFW_PLATFORM_LIBRARY_WINDOW_STATE;
-    // This is defined in the context API's context.h
-    _GLFW_PLATFORM_LIBRARY_CONTEXT_STATE
     // This is defined in the platform's joystick.h
     _GLFW_PLATFORM_LIBRARY_JOYSTICK_STATE
-    // This is defined in egl_context.h
-    _GLFWlibraryEGL egl;
-    // This is defined in osmesa_context.h
-    _GLFWlibraryOSMesa osmesa;
 
     struct {
         GLFWDragSourceItem *items;
@@ -714,8 +594,7 @@ void _glfwPlatformTerminateJoysticks(void);
 int _glfwPlatformPollJoystick(_GLFWjoystick *js, int mode);
 void _glfwPlatformUpdateGamepadGUID(char *guid);
 
-int _glfwPlatformCreateWindow(
-    _GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _GLFWctxconfig *ctxconfig, const _GLFWfbconfig *fbconfig, const GLFWLayerShellConfig *lsc);
+int _glfwPlatformCreateWindow(_GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _GLFWfbconfig *fbconfig, const GLFWLayerShellConfig *lsc);
 void _glfwPlatformDestroyWindow(_GLFWwindow *window);
 void _glfwPlatformSetWindowTitle(_GLFWwindow *window, const char *title);
 void _glfwPlatformSetWindowIcon(_GLFWwindow *window, int count, const GLFWimage *images);
@@ -739,7 +618,7 @@ void _glfwPlatformRestoreWindow(_GLFWwindow *window);
 void _glfwPlatformMaximizeWindow(_GLFWwindow *window);
 void _glfwPlatformShowWindow(_GLFWwindow *window, bool move_to_active_screen);
 void _glfwPlatformHideWindow(_GLFWwindow *window);
-void _glfwPlatformRequestWindowAttention(_GLFWwindow *window);
+void _glfwPlatformSetWindowAttention(_GLFWwindow *window, bool requested);
 int _glfwPlatformWindowBell(_GLFWwindow *window);
 void _glfwPlatformFocusWindow(_GLFWwindow *window);
 void _glfwPlatformSetWindowMonitor(_GLFWwindow *window, _GLFWmonitor *monitor, int xpos, int ypos, int width, int height, int refreshRate);
@@ -762,14 +641,11 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev);
 void _glfwPlatformChangeCursorTheme(void);
 void _glfwPlatformTitlebarSettingsChanged(void);
 
+void _glfwPlatformWindowContentsPresented(_GLFWwindow *window);
 void _glfwPlatformPollEvents(void);
 void _glfwPlatformWaitEvents(void);
 void _glfwPlatformWaitEventsTimeout(monotonic_t timeout);
 void _glfwPlatformPostEmptyEvent(void);
-
-EGLenum _glfwPlatformGetEGLPlatform(EGLint **attribs);
-EGLNativeDisplayType _glfwPlatformGetEGLNativeDisplay(void);
-EGLNativeWindowType _glfwPlatformGetEGLNativeWindow(_GLFWwindow *window);
 
 void _glfwPlatformGetRequiredInstanceExtensions(char **extensions);
 int _glfwPlatformGetPhysicalDevicePresentationSupport(VkInstance instance, VkPhysicalDevice device, uint32_t queuefamily);
@@ -795,6 +671,7 @@ void _glfwInputWindowOcclusion(_GLFWwindow *window, bool occluded);
 void _glfwInputWindowPos(_GLFWwindow *window, int xpos, int ypos);
 void _glfwInputWindowSize(_GLFWwindow *window, int width, int height);
 void _glfwInputFramebufferSize(_GLFWwindow *window, int width, int height);
+void _glfwInputNativeSurfaceChanged(_GLFWwindow *window);
 void _glfwInputWindowContentScale(_GLFWwindow *window, float xscale, float yscale);
 void _glfwInputWindowIconify(_GLFWwindow *window, bool iconified);
 void _glfwInputWindowMaximize(_GLFWwindow *window, bool maximized);
@@ -806,8 +683,12 @@ void _glfwInputKeyboard(_GLFWwindow *window, GLFWkeyevent *ev);
 void _glfwInputClipboardLost(GLFWClipboardType which);
 void _glfwInputScroll(_GLFWwindow *window, const GLFWScrollEvent *ev);
 void _glfwInputTouch(_GLFWwindow *window, const GLFWTouchEvent *ev);
-void _glfwInputMouseClick(_GLFWwindow *window, int button, int action, int mods);
-void _glfwInputCursorPos(_GLFWwindow *window, double xpos, double ypos);
+// timestamp is when the system generated the event, on the clock of
+// monotonic(), zero for events that do not come from the system, which then
+// have the time they are delivered
+void _glfwInputMouseClick(_GLFWwindow *window, int button, int action, int mods, monotonic_t timestamp);
+void _glfwInputCursorPos(_GLFWwindow *window, double xpos, double ypos, monotonic_t timestamp);
+void _glfwInputReleaseHeldMouseButtons(_GLFWwindow *window);
 void _glfwInputCursorEnter(_GLFWwindow *window, bool entered);
 // Platform functions for drop data reading
 void _glfwPlatformRequestDropUpdate(_GLFWwindow *window);
@@ -853,9 +734,6 @@ void _glfwDebug(const char *format, ...);
 //////                       GLFW internal API                      //////
 //////////////////////////////////////////////////////////////////////////
 
-bool _glfwStringInExtensionString(const char *string, const char *extensions);
-bool _glfwRefreshContextAttribs(_GLFWwindow *window, const _GLFWctxconfig *ctxconfig);
-bool _glfwIsValidContextConfig(const _GLFWctxconfig *ctxconfig);
 
 const GLFWvidmode *_glfwChooseVideoMode(_GLFWmonitor *monitor, const GLFWvidmode *desired);
 int _glfwCompareVideoModes(const GLFWvidmode *first, const GLFWvidmode *second);

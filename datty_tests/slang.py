@@ -9,31 +9,44 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from datty.constants import slangc
+from datty.constants import gpu_driver_path, is_macos, shaders_dir, slangc
+from datty.fast_data_types import gpu_shader_target, load_gpu_driver
 from datty.shaders.slang import (
+    METAL_FIXUP_MARKER,
+    MSL_PUSH_CONSTANTS_NAME,
+    PUSH_CONSTANTS_MAX_SIZE,
     EntryPoint,
+    GLSLMetadata,
     LoadShaderPrograms,
+    ShaderTarget,
     SlangFile,
     SlangShaderQuery,
     Stage,
     apply_pipeline_specializations,
-    build_custom_shader_pipeline_glsl,
+    build_custom_shader_pipeline,
     build_import_graph,
     cell_variant,
     cell_variations,
     clear_caches,
     custom_shader,
     defines_pointer_map,
+    fixup_metal_code,
     get_custom_pipeline_src,
+    get_custom_shader_src,
+    metal_compiler_available,
+    msl_validation_command,
     parse_pipeline_definition,
     parse_slang_declarations,
     parse_slang_text,
     parse_var_directive,
     pipeline_definition,
     pointer_map_shaders,
+    program_metadata,
     slangc_version,
+    spirv_validation_command,
     text_contrast_is_identity,
     topological_layers,
     topological_sort,
@@ -45,7 +58,186 @@ from .base import BaseTest
 _SUPPORT_SHADER_NAMES = frozenset(('types', 'pipeline'))
 
 
+def driver_shader_target() -> ShaderTarget:
+    # The shader target of the GPU driver, loading the driver does not need a window
+    if not gpu_shader_target():
+        load_gpu_driver(gpu_driver_path())
+    return ShaderTarget.parse(gpu_shader_target())
+
+
 class TestSlang(BaseTest):
+    def test_program_params(self):
+        # The uniform parameters of every built-in program are in a single
+        # push constant block shared by all stages, see PUSH_CONSTANTS_MAX_SIZE
+        target = driver_shader_target()
+        tdir = os.path.join(shaders_dir, target.id)
+        names = [x for x in os.listdir(tdir) if x.endswith('.json')]
+        self.assertTrue(names, f'No compiled shaders in {tdir}')
+        for name in names:
+            with open(os.path.join(tdir, name)) as f:
+                m = json.load(f)
+            push = [b for b in m['param_blocks'] if b['slot'] < 0]
+            self.assertLessEqual(len(push), 1, name)
+            for b in push:
+                self.assertFalse(b['name'], name)
+                self.assertLessEqual(b['size'], PUSH_CONSTANTS_MAX_SIZE, name)
+            for b in m['param_blocks']:
+                self.assertNotIn('stage', b, name)
+        if target.family == 'glsl':
+            # OpenGL window framebuffers have their origin at the bottom left,
+            # vertex shaders flip y when datty_flip_y is -1, see fixup_opengl_code()
+            for name in os.listdir(tdir):
+                if name.endswith('.vert.glsl'):
+                    with open(os.path.join(tdir, name)) as f:
+                        src = f.read()
+                    self.assertIn('uniform float datty_flip_y;', src, name)
+                    self.assertIn('gl_Position.y *= datty_flip_y;', src, name)
+        if 'trail.json' in names:
+            with open(os.path.join(tdir, 'trail.json')) as f:
+                m = json.load(f)
+            (push,) = (b for b in m['param_blocks'] if b['slot'] < 0)
+            self.assertEqual({'x_coords', 'y_coords', 'cursor_edge_x', 'cursor_edge_y', 'trail_color', 'trail_opacity'}, {f['name'] for f in push['fields']})
+
+        def field(name: str, offset: int) -> dict:
+            t = {'kind': 'vector', 'elementCount': 4, 'elementType': {'kind': 'scalar', 'scalarType': 'float32'}}
+            return {'name': name, 'type': t, 'binding': {'kind': 'uniform', 'offset': offset, 'size': 16}}
+
+        def push_block(size: int) -> dict:
+            fields = [field(f'f{i}', 16 * i) for i in range(size // 16)]
+            return {
+                'name': 'uniforms',
+                'binding': {'kind': 'pushConstantBuffer', 'index': 0},
+                'type': {
+                    'kind': 'constantBuffer',
+                    'elementVarLayout': {
+                        'type': {'kind': 'struct', 'name': 'Params', 'fields': fields},
+                        'binding': {'kind': 'uniform', 'offset': 0, 'size': size},
+                    },
+                },
+            }
+
+        refl = {'parameters': [push_block(32)], 'entryPoints': [{'name': 'vertex_main', 'stage': 'vertex', 'parameters': []}]}
+        m = program_metadata(target, [refl, refl], GLSLMetadata())
+        self.assertEqual(1, len(m['param_blocks']))
+        self.assertEqual(['f0', 'f1'], [f['name'] for f in m['param_blocks'][0]['fields']])
+        # Too large for push constants
+        with self.assertRaises(ValueError):
+            program_metadata(target, [{'parameters': [push_block(PUSH_CONSTANTS_MAX_SIZE + 16)], 'entryPoints': []}], GLSLMetadata())
+        # Uniform parameters of entry points are not allowed
+        refl = {'parameters': [], 'entryPoints': [{'name': 'vertex_main', 'stage': 'vertex', 'parameters': [field('x', 0)]}]}
+        with self.assertRaises(ValueError):
+            program_metadata(target, [refl], GLSLMetadata())
+
+    def test_msl_target(self):
+        # Metal has y=1 at the top in NDC, the vertex entry point negates it, see fixup_metal_code()
+        msl = """
+struct Params_0
+{
+    float4 rect_0;
+};
+
+struct vertex_main_Result_0
+{
+    float2 texcoord_0 [[user(TEXCOORD)]];
+    float4 position_0 [[position]];
+};
+
+[[vertex]] vertex_main_Result_0 vertex_main(uint vertex_id_0 [[vertex_id]], Params_0 constant* uniforms_0 [[buffer(0)]])
+{
+    vertex_main_Result_0 r_0;
+    if (vertex_id_0 == 0U) { r_0.position_0 = float4(0); return r_0; }
+    r_0.position_0 = float4(1);
+    return r_0;
+}
+
+[[fragment]] float4 fragment_main(float2 texcoord_0 [[stage_in]]) { return float4(texcoord_0, 0, 1); }
+"""
+        eps = {'vertex': 'vertex_main', 'fragment': 'fragment_main'}
+        fixed = fixup_metal_code(msl, eps, 'test')
+        self.assertIn(METAL_FIXUP_MARKER, fixed)
+        self.assertIn('r.position_0.y = -r.position_0.y;', fixed)
+        self.assertEqual(2, fixed.count('return datty_flip_y(r_0);'))
+        self.assertIn('return float4(texcoord_0, 0, 1);', fixed)
+        self.ae(fixed, fixup_metal_code(fixed, eps, 'test'))
+        with self.assertRaises(ValueError):
+            fixup_metal_code(msl, {'vertex': 'missing', 'fragment': 'fragment_main'}, 'test')
+
+        # Slang assigns Metal argument table indices itself, they are passed
+        # as native names, while the slots remain those of SHADER_BINDING_SLOTS
+        target = ShaderTarget.parse('msl-31')
+        self.assertTrue(target.is_msl and target.is_single_module)
+        scalar = {'kind': 'scalar', 'scalarType': 'float32'}
+
+        def cbuffer(var: str, tname: str, index: int, fields: list[dict]) -> dict:
+            return {
+                'name': var,
+                'binding': {'kind': 'constantBuffer', 'index': index},
+                'type': {
+                    'kind': 'constantBuffer',
+                    'elementVarLayout': {
+                        'type': {'kind': 'struct', 'name': tname, 'fields': fields},
+                        'binding': {'kind': 'uniform', 'offset': 0, 'size': 4 * len(fields)},
+                    },
+                },
+            }
+
+        def field(name: str, offset: int, scalar_type: str = 'float32') -> dict:
+            return {'name': name, 'type': {'kind': 'scalar', 'scalarType': scalar_type}, 'binding': {'kind': 'uniform', 'offset': offset, 'size': 4}}
+
+        texture = {
+            'name': 'sprites',
+            'bindings': [{'kind': 'shaderResource', 'index': 1}, {'kind': 'samplerState', 'index': 2}],
+            'type': {'kind': 'resource', 'baseShape': 'texture2D', 'combined': True, 'resultType': scalar},
+        }
+        refl = {
+            'parameters': [
+                cbuffer('uniforms', 'Params', 0, [field('a', 0), field('b', 4)]),
+                cbuffer('crd', 'CellRenderData', 3, [field('x', 0)]),
+                cbuffer('glt', 'GammaLUT', 2, [field('gamma_lut', 0)]),
+                texture,
+            ],
+            'entryPoints': [{'name': 'vertex_main', 'stage': 'vertex', 'parameters': []}, {'name': 'fragment_main', 'stage': 'fragment', 'parameters': []}],
+        }
+        m = program_metadata(target, [refl], GLSLMetadata())
+        self.ae(m['target'], 'msl-31')
+        self.ae(m['entry_points'], {'vertex': 'vertex_main', 'fragment': 'fragment_main'})
+        self.ae(m['textures'], {'sprites': 0})
+        self.ae(m['blocks']['CellRenderData']['slot'], 6)
+        self.ae(
+            m['native_names'],
+            {MSL_PUSH_CONSTANTS_NAME: 'buffer(0)', 'CellRenderData': 'buffer(3)', 'GammaLUT': 'buffer(2)', 'sprites': 'texture(1) sampler(2)'},
+        )
+        self.ae([(b['name'], b['slot']) for b in m['param_blocks']], [('GammaLUT', 8), ('', -1)])
+        # Metal bools are a single byte, see check_msl_bools()
+        refl['parameters'][0] = cbuffer('uniforms', 'Params', 0, [field('a', 0, 'bool'), field('b', 4, 'bool')])
+        with self.assertRaises(ValueError):
+            program_metadata(target, [refl], GLSLMetadata())
+        refl['parameters'][0] = cbuffer('uniforms', 'Params', 0, [field('a', 0, 'bool'), field('b', 4)])
+        program_metadata(target, [refl], GLSLMetadata())
+
+        # The built-in shaders compiled for MSL, if they were built
+        tdir = os.path.join(shaders_dir, target.id)
+        if not os.path.isdir(tdir):
+            return
+        names = [x for x in os.listdir(tdir) if x.endswith('.json')]
+        self.assertTrue(names, f'No compiled shaders in {tdir}')
+        for name in names:
+            with open(os.path.join(tdir, name)) as f:
+                m = json.load(f)
+            with open(os.path.join(tdir, name.replace('.json', '.metal'))) as f:
+                code = f.read()
+            self.assertIn(METAL_FIXUP_MARKER, code, name)
+            nn = m['native_names']
+            if any(b['slot'] < 0 for b in m['param_blocks']):
+                self.assertRegex(nn[MSL_PUSH_CONSTANTS_NAME], r'^buffer\(\d+\)$', name)
+            for tex in m['textures']:
+                self.assertRegex(nn[tex], r'^texture\(\d+\) sampler\(\d+\)$', name)
+            for block in list(m['blocks']) + [b['name'] for b in m['param_blocks'] if b['slot'] >= 0]:
+                # Vertex buffers use the highest buffer indices, see VERTEX_BUFFER_INDEX in gpu/metal/internal.h
+                self.assertLess(int(nn[block][len('buffer(') : -1]), 15, name)
+            for ep in m['entry_points'].values():
+                self.assertIn(f' {ep}(', code, name)
+
     def test_animation_step_parsing(self):
         def step(val):
             return parse_pipeline_definition(['startgroup', f'animation_step {val}', 'shaders focus-highlight', 'endgroup'], 'test')['groups'][0][
@@ -168,6 +360,66 @@ class TestSlang(BaseTest):
         ]
         self.ae(simulate_custom_shader_animation(p, ticks), expected)
 
+    def test_custom_shader_progress_events_and_windows(self):
+        import re
+
+        from datty.fast_data_types import CUSTOM_SHADER_WINDOW_TEXELS, CUSTOM_SHADER_WINDOWS_PER_ROW, simulate_custom_shader_animation
+
+        # The layout of the windows texture must be the same in C and the shaders
+        src = get_custom_shader_src('types').decode()
+
+        def slang_constant(name: str) -> int:
+            m = re.search(rf'static const uint {name} = (\d+);', src)
+            assert m is not None, f'{name} not found in types.slang'
+            return int(m.group(1))
+
+        self.ae(slang_constant('DATTY_WINDOW_TEXELS'), CUSTOM_SHADER_WINDOW_TEXELS)
+        self.ae(slang_constant('DATTY_WINDOWS_PER_ROW'), CUSTOM_SHADER_WINDOWS_PER_ROW)
+        # The texels used by DattyWindows.get() must fit in a window's texels
+        used = [int(x) for x in re.findall(r'texel\(idx, (\d+)\)', src)]
+        self.assertTrue(used)
+        self.assertLess(max(used), CUSTOM_SHADER_WINDOW_TEXELS)
+
+        p = parse_pipeline_definition(
+            ['startgroup', 'animation_start progress-start', 'animation_stop progress-stop', 'animation_step 0', 'shaders progress-bar', 'endgroup'], 'test'
+        )
+        self.ae(p['groups'][0]['animation_start'], ('progress-start',))
+        self.ae(p['groups'][0]['animation_end_events'], ('progress-stop',))
+        ticks: list[tuple[str, ...]] = [(), ('progress-start',), (), ('progress-stop',), ()]
+        self.ae(simulate_custom_shader_animation(p, ticks), [(False,), (True,), (True,), (False,), (False,)])
+
+    def test_custom_shader_focus_changes_between_frames(self):
+        # https://github.com/kovidgoyal/datty/issues/10871 focus changes that
+        # happen before the OS window is next rendered, for instance, while it
+        # is hidden, must leave groups in the state for the final focus, rather
+        # than look like simultaneous focus-out and focus-in events
+        from datty.fast_data_types import simulate_custom_shader_animation
+
+        lines = []
+        for spec in (
+            'animation_start os-window-focus-in\nanimation_stop os-window-focus-out',
+            'animation_start os-window-focus-out\nanimation_stop os-window-focus-in',
+            'animation_start window-focus-in|user-activity\nanimation_stop window-focus-out',
+        ):
+            lines.append('startgroup')
+            lines.extend(spec.splitlines())
+            lines.extend(('animation_step 0', 'shaders sample', 'endgroup'))
+        p = parse_pipeline_definition(lines, 'test')
+        focused, unfocused = (True, False, True), (False, True, False)
+        ticks: list[tuple[str, ...]] = [
+            ('focus:in',),
+            ('focus:out', 'focus:in'),  # hidden and shown again
+            ('focus:in', 'focus:out'),  # briefly focused while hidden
+            ('focus:in', 'focus:out', 'focus:in'),
+            ('focus:out', 'focus:in', 'focus:out'),
+            ('focus:in',),
+            # A start event in the same frame as focus out is a hard stop
+            ('focus:out', 'user-activity'),
+            ('user-activity',),
+        ]
+        expected = [focused, focused, unfocused, focused, unfocused, focused, unfocused, (False, True, True)]
+        self.ae(simulate_custom_shader_animation(p, ticks), expected)
+
     def test_custom_shader_animation_progress(self):
         from datty.fast_data_types import simulate_custom_shader_animation
 
@@ -268,7 +520,8 @@ class TestSlang(BaseTest):
         self.ae(pipeline['groups'][0]['animation_step'], 0)
         with (
             patch('datty.shaders.slang.parse_pipeline', return_value=pipeline),
-            patch('datty.shaders.slang.build_custom_shader_pipeline_glsl', return_value=('vertex', 'fragment', {})),
+            patch('datty.shaders.slang.build_custom_shader_pipeline', return_value=('vertex', 'fragment', {})),
+            patch('datty.shaders.slang.current_shader_target', return_value=driver_shader_target()),
             patch('datty.shaders.slang.compile_program') as compile_program,
         ):
             for shaders in (('test',), (), ('test',)):
@@ -744,7 +997,7 @@ float f() { static const float SCAN = 2; return SCAN; }
         self.assertEqual(p['groups'][0]['shaders'], ('sample',))
         self.assertEqual(p['groups'][1]['shaders'], ('sample',))
 
-    def test_build_custom_shader_pipeline_glsl(self):
+    def test_build_custom_shader_pipeline(self):
         if not shutil.which(slangc()[0]):
             self.skipTest(f'slangc ({slangc()[0]}) not found in PATH')
 
@@ -760,9 +1013,9 @@ float f() { static const float SCAN = 2; return SCAN; }
                 'test',
             )
             try:
-                vert_src, frag_src, metadata = build_custom_shader_pipeline_glsl(p, cache_dir=cache_dir)
+                vert_src, frag_src, metadata = build_custom_shader_pipeline(p, driver_shader_target(), cache_dir=cache_dir)
                 invocation_tracker = set()
-                build_custom_shader_pipeline_glsl(p, cache_dir=cache_dir, invocation_tracker=invocation_tracker)
+                build_custom_shader_pipeline(p, driver_shader_target(), cache_dir=cache_dir, invocation_tracker=invocation_tracker)
             finally:
                 clear_caches()
 
@@ -793,7 +1046,7 @@ float f() { static const float SCAN = 2; return SCAN; }
                 'test',
             )
             try:
-                _, pm_frag_src, pm_metadata = build_custom_shader_pipeline_glsl(p, cache_dir=cache_dir)
+                _, pm_frag_src, pm_metadata = build_custom_shader_pipeline(p, driver_shader_target(), cache_dir=cache_dir)
             finally:
                 clear_caches()
         self.assertTrue(pm_metadata['has_pointer_map'])
@@ -831,6 +1084,11 @@ float f() { static const float SCAN = 2; return SCAN; }
         return h.hexdigest()
 
     def test_all_custom_shaders_compile(self) -> None:
+        if sys.platform == 'linux' and 'arm64' in os.environ.get('BYPY_ARCH', ''):
+            # The Linux ARM build runs under emulation where slangc is
+            # extremely slow and the generated code is architecture
+            # independent, so it is already tested by the other builds
+            self.skipTest('Running under emulation')
         if __file__ and os.path.isdir((local := os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.cache'))):
             cache_base = local
         else:
@@ -858,33 +1116,91 @@ float f() { static const float SCAN = 2; return SCAN; }
             if entry.name.endswith('.slang') and entry.name[: -len('.slang')] not in _SUPPORT_SHADER_NAMES
         )
 
-        with tempfile.TemporaryDirectory() as cache_dir:
-            failures: list[str] = []
-            clear_caches()
-            for name in shader_names:
-                pipeline = parse_pipeline_definition(
-                    ['startgroup', f'shaders {name}', 'endgroup'],
-                    name,
-                )
-                try:
-                    vert_src, frag_src, _ = build_custom_shader_pipeline_glsl(pipeline, cache_dir=cache_dir)
-                except Exception as e:
-                    failures.append(f'{name}: {e}')
-                    continue
-                if not vert_src:
-                    failures.append(f'{name}: empty vertex GLSL')
-                if not frag_src:
-                    failures.append(f'{name}: empty fragment GLSL')
-            clear_caches()
-            # Builtin pipelines can override constants with var and chain
-            # shaders, so compile them as well
-            pipeline_names = sorted(entry.name[: -len('.pipeline')] for entry in pkg.iterdir() if entry.name.endswith('.pipeline'))
-            for name in pipeline_names:
-                try:
+        # Compile for the targets of the GPU drivers that matter on this
+        # platform: Metal on macOS and OpenGL and Vulkan elsewhere. The
+        # built-in shaders are compiled for the targets of all built drivers,
+        # so use those to get the correct versions.
+        families = ('msl',) if is_macos else ('glsl', 'spirv')
+        targets = sorted(
+            (
+                ShaderTarget.parse(x)
+                for x in os.listdir(shaders_dir)
+                if x.partition('-')[0] in families and os.path.isfile(os.path.join(shaders_dir, x, 'cell.json'))
+            ),
+            key=lambda t: t.id,
+        )
+        if not targets:
+            self.fail(f'The built-in shaders have not been compiled for any of the shader targets: {families} in {shaders_dir}')
+        failures: list[str] = []
+
+        def check(name: str, target: ShaderTarget, vert_src: str | bytes, frag_src: str | bytes, tdir: str) -> None:
+            if not vert_src:
+                failures.append(f'{name}: empty vertex shader for {target.id}')
+            if not frag_src:
+                failures.append(f'{name}: empty fragment shader for {target.id}')
+            if target.is_spirv and isinstance(vert_src, bytes) and shutil.which('spirv-val'):
+                path = os.path.join(tdir, 'check.spv')
+                with open(path, 'wb') as f:
+                    f.write(vert_src)
+                cp = subprocess.run(spirv_validation_command(target, path), capture_output=True)
+                if cp.returncode != 0:
+                    failures.append(f'{name}: invalid SPIR-V: {cp.stderr.decode()}{cp.stdout.decode()}')
+            if target.is_msl and isinstance(vert_src, str):
+                if METAL_FIXUP_MARKER not in vert_src:
+                    failures.append(f'{name}: the MSL code was not fixed up')
+                if metal_compiler_available():
+                    path = os.path.join(tdir, 'check.metal')
+                    with open(path, 'w') as f:
+                        f.write(vert_src)
+                    cp = subprocess.run(msl_validation_command(target, path), capture_output=True)
+                    if cp.returncode != 0:
+                        failures.append(f'{name}: invalid MSL: {cp.stderr.decode()}{cp.stdout.decode()}')
+
+        # Builtin pipelines can override constants with var and chain
+        # shaders, so compile them as well
+        pipeline_names = sorted(entry.name[: -len('.pipeline')] for entry in pkg.iterdir() if entry.name.endswith('.pipeline'))
+        jobs = [(name, False) for name in shader_names] + [(name, True) for name in pipeline_names]
+
+        def compile_job(name: str, is_pipeline: bool, cache_dir: str) -> None:
+            label = f'{name}.pipeline' if is_pipeline else name
+            try:
+                if is_pipeline:
                     pipeline = parse_pipeline_definition(get_custom_pipeline_src(name).decode().splitlines(), name)
-                    build_custom_shader_pipeline_glsl(pipeline, cache_dir=cache_dir)
+                else:
+                    pipeline = parse_pipeline_definition(['startgroup', f'shaders {name}', 'endgroup'], name)
+            except Exception as e:
+                failures.append(f'{label}: {e}')
+                return
+            # The slang modules are target independent, so sharing the cache
+            # dir between targets means they are only built once
+            for target in targets:
+                try:
+                    vert_src, frag_src, _ = build_custom_shader_pipeline(pipeline, target, cache_dir=cache_dir)
                 except Exception as e:
-                    failures.append(f'{name}.pipeline: {e}')
+                    failures.append(f'{label} for {target.id}: {e}')
+                    continue
+                check(label, target, vert_src, frag_src, cache_dir)
+
+        # Each job uses its own cache dir, as building is serialized per cache
+        # dir. Compilation happens in slangc subprocesses so threads are fine.
+        # The first job is run alone and its cache dir used to seed the others,
+        # so that the shared types module is built only once. This matters
+        # when running under emulation, where slangc is very slow.
+        clear_caches()
+        try:
+            with tempfile.TemporaryDirectory() as tdir:
+                seed = os.path.join(tdir, 'seed')
+                compile_job(*jobs[0], seed)
+
+                def run_job(i: int) -> None:
+                    cache_dir = os.path.join(tdir, str(i))
+                    shutil.copytree(seed, cache_dir)
+                    compile_job(*jobs[i], cache_dir)
+
+                with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as executor:
+                    for future in [executor.submit(run_job, i) for i in range(1, len(jobs))]:
+                        future.result()
+        finally:
             clear_caches()
 
         if failures:

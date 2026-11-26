@@ -150,6 +150,12 @@ def main() -> None:
         if first_arg.startswith('+'):
             namespaced(['+', first_arg[1:]] + sys.argv[2:])
         else:
+            # Garbage collection during startup costs ~10ms and finds almost
+            # nothing to collect, so disable it until the main loop starts,
+            # see _run_app() in main.py
+            import gc
+
+            gc.disable()
             from datty.main import main as datty_main
 
             datty_main()

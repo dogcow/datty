@@ -122,100 +122,322 @@ for seamless and intuitive session file creation.
 Detailed list of changes
 -------------------------------------
 
-0.50.1 [unreleased]
+1.0.0 [future]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- New rendering engine with pluggable GPU drivers: datty now renders with
+  **Metal** on macOS and **Vulkan** on Linux and BSD, falling back to OpenGL.
+  On systems with no usable GPU, such as virtual machines, it falls back to
+  CPU rendering with the Mesa lavapipe/llvmpipe software renderers. The new
+  :opt:`gpu_driver` option controls which drivers are tried and in what order,
+  use :option:`datty --debug-rendering` to see which one was chosen and why
+
+- Support for **bidirectional text** (Arabic, Hebrew, etc.) using FriBidi, with
+  the ECMA-48 bidi mode (``CSI 8 h``), automatic paragraph direction
+  (``CSI ? 2501 h``) and Select Character Path controls. Right-to-left runs are
+  shaped in their correct direction, the cursor, IME and selections work on
+  reordered lines and bidi settings are preserved in the scrollback pager,
+  copied ANSI text and saved sessions, see :ref:`bidi_support`
+
+- A new :doc:`smooth scrolling protocol <smooth-scrolling-protocol>` that lets
+  programs define up to four rectangular regions of the screen that the
+  terminal scrolls, vertically or horizontally, by amounts in pixels, with
+  images moving along with the text
+
+- A new mode (``5523``) to :ref:`report all mouse events to programs in full
+  detail <detailed_mouse_events>`, in an encoding that is valid ECMA-48, unlike
+  SGR pixel mouse reporting, which uses negative numbers. Every event has the
+  cell and pixel position, the buttons held, the modifiers, the time of the
+  event and a serial. Presses and releases have click counts that respect the
+  double click interval of the desktop, the mouse entering and leaving the
+  window is reported and scroll events have pixel or high resolution deltas,
+  the device kind, gesture phase and momentum/natural scrolling flags. Daddies
+  can use it via ``Loop.DetailedMouseEvents()``
+
+- Sessions: A new :ac:`set_session` action and :ref:`daddy @ set-session
+  <at-set-session>` remote control command to move existing windows and tabs
+  to another session (:iss:`10941`)
+
+- Initial support for the proposed glyph protocol (:iss:`10872`), allowing
+  programs to register their own vector glyphs for codepoints in a reserved
+  block and have datty render them, including multi-color glyphs and gradients
+
+- Much faster startup, the first frame is shown ~25-35ms sooner on Linux and
+  even more on macOS: fonts are now selected in C, in a background thread, the
+  GPU driver is loaded in a thread on Wayland, slow Python imports are deferred
+  and garbage collection is disabled during startup. A new
+  :option:`datty --debug-startup` flag prints timings for the phases of startup
+
+- Major throughput improvements, see :doc:`performance` for updated
+  comparisons with other terminals: output is parsed as soon as it arrives
+  rather than in delayed chunks, a batched drawing path speeds up non-ASCII and
+  CJK text by up to 70%, a new :term:`SIMD` UTF-8 decoder is 2.6x faster,
+  common CSI escape codes are parsed in a single fast pass, text that scrolls
+  the screen and cells with many combining chars are processed faster, and
+  adding lines to the scrollback uses non-temporal stores (~30% faster)
+
+- Greatly reduced memory use of the scrollback: cell colors and attributes are
+  now stored in a per screen table of styles and looked up in the shaders, so
+  each scrollback cell uses 12 bytes instead of 32. This also makes plain text
+  output up to 48% faster and uploads 60% less data to the GPU per cell
+
+- The ``sync_to_monitor`` and ``repaint_delay`` options are replaced by the new
+  :opt:`render_interval` option, which by default syncs redraws to the monitor
+  refresh rate, using the Present extension on X11, with an optional
+  frame rate cap, and stops rendering hidden windows. The old options are
+  converted automatically. The ``input_delay`` option has been removed as it is
+  no longer needed
+
+- :doc:`Custom shaders </custom-shaders>`: Allow shaders to draw the progress
+  bars reported by programs with OSC 9;4, via new ``progress-start`` and
+  ``progress-stop`` events and a per window texture describing all visible
+  windows. A sample progress bar shader is included (:iss:`10923`)
+
+- :opt:`cursor_trail_start_threshold`: Add a ``prompt`` keyword to show the
+  cursor trail only for movement at the shell prompt, not in the output of
+  commands or for the jump to the next prompt, when using
+  :ref:`shell_integration` (:iss:`8147`)
+
+- macOS: datty now requires macOS 14 or newer and uses ``CADisplayLink`` for
+  render timing. Main loop wakeups and timers are cheaper, speeding up output
+  with long escape codes and images by ~70% on Apple silicon
+
+- Remote control: Automatically remove stale UNIX sockets left behind by a
+  killed datty instance when using :option:`datty --listen-on`
+
+- Fix selections jumping to other text when only part of the screen scrolls,
+  for example, in programs that use a scroll region to append output above
+  their input area (:iss:`10930`)
+
+- Fix pointed Hebrew and Arabic lam-alef ligatures being grouped with the
+  wrong cells (:iss:`10891`)
+
+- Fix the cursor taking the colors of the cell above it while rendering is
+  paused with pixel scrolling (:iss:`10892`)
+
+- Fix combining chars written at the start of a soft wrapped line not being
+  drawn until the row above is redrawn (:iss:`10929`)
+
+- Fix the wrong face being selected for named styles of variable fonts in font
+  collection files, and fonts with non UTF-8 axis tags breaking font selection
+  on macOS. Variable fonts in WOFF/WOFF2 files are now supported
+
+- Fix the colors of the window size text shown during live resize being too
+  dark
+
+- macOS: Fix notification urgency being ignored
+
+- Sessions: Preserve literal dollar signs in working directories, titles and
+  other values when restoring a saved session
+
+- Sessions: Resolve relative paths in :option:`launch --cwd` with respect to
+  the directory containing the session file, as is done for ``cd``
+
+- Use an accurate title for the overlay showing errors during startup that are
+  not caused by invalid config
+
+- :doc:`benchmark daddy <performance>`: Add benchmarks for text with many
+  distinct colors, scrollback, rendering and bidi, a ``--output`` flag to save
+  results as JSON and a script to compare multiple terminals
+
+- Building datty now requires libfribidi, libbrotlidec (except on macOS) and,
+  for the Vulkan driver, the Vulkan headers. The Go SIMD code now uses the
+  Go ``simd`` package with ``GOEXPERIMENT=simd``
+
+- XWayland: Fix scrolling with the touchpad being too slow, and becoming much
+  too fast or the mouse wheel not scrolling, when both a touchpad and a mouse
+  wheel are used (:iss:`10938`)
+
+- Linux: Fix events for file descriptors being dispatched to the wrong handler
+  when a handler, such as a drag and drop or DBus one, stops watching a file
+  descriptor while events are being processed
+
+- X11: Fix dropping files into programs that accept drops, such as the
+  :doc:`dnd daddy </daddies/dnd>`, failing silently (:iss:`10944`)
+
+0.51.1 [2026-11-23]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- A new :ac:`clear_bell_indicators` action to clear the bell indicators of all
+  windows, or windows matching an expression, without needing to focus them.
+  This also dismisses system attention requests on macOS and X11 (:iss:`10916`)
+
+- :ref:`Launch wrapper <launch_wrapper>`: Allow the wrapper to keep windows
+  created with :option:`launch --hold` open itself, so that the shell runs
+  inside the wrapper, via a new ``hold`` field in ``LaunchContext`` and a new
+  ``LaunchPrefix`` return type. Fix the wrapper not being used for programs run
+  in an already running panel or quick access terminal in single instance mode
+  (:iss:`10901`, :pull:`10900`)
+
+- :doc:`launch <launch>`: Run the program by name instead of resolving it to a
+  full path first, so that wrappers look it up in their own :envvar:`PATH` and
+  the program sees itself invoked by name, as when run from a shell. Programs
+  found only via :opt:`exe_search_path` are still run via their full path
+  (:iss:`10914`)
+
+- :opt:`window_title_template`: Add :code:`{window}` with the window id,
+  working directory and size (:pull:`10905`)
+
+- Window drag and drop: In layouts that can only reorder windows, such as Tall
+  and Grid, highlight the whole target window and have the dropped window take
+  its place. In the Splits layout, dropping onto the side of a window that the
+  dragged window is already on now swaps them (:pull:`10908`)
+
+- Security: Fix programs running in a window being able to inject arbitrary
+  commands into saved session files via line breaks in the working directory
+  or user variables. Fix a malicious remote drop source in the dnd daddy or
+  sender in the file transfer protocol being able to write files outside the
+  destination directory via previously sent symlinks (follow up to
+  :cve:`2026-54056` and :cve:`2026-54055`)
+
+- Docks: Fix docks changing size when switching tabs or opening and closing
+  windows when :opt:`single_window_margin_width` or
+  :opt:`single_window_padding_width` is set
+
+- Graphics: Fix animated images stopping when switching to a tab without
+  animations and back and images taller than the screen, such as those
+  displayed by :doc:`icat <daddies/icat>`, not being scrolled fully, causing
+  subsequent output to be drawn over them (:iss:`10894`, :iss:`10924`)
+
+- Fix a single window with :opt:`draw_window_borders_for_single_window` having
+  no border, or its rounded border being hidden, when its margin is narrower
+  than its border. Fix the text in window title bars being drawn with the old
+  cell size after a font size change (:iss:`10899`, :pull:`10903`)
+
+- Watchers and daddies: Remove the limit on the number of simultaneously
+  pending timers, which caused "Too many timers added" errors. Fix crashes
+  when a timer is removed by another timer firing at the same time on Linux and
+  when calling :code:`Screen.hyperlink_at()` with coordinates outside the
+  screen (:iss:`10890`)
+
+- :ac:`combine`: Fix the third and subsequent actions in a mouse mapping not
+  being run for the window that was clicked
+
+- Preserve non-ASCII hyperlink IDs and URLs when exporting terminal text with
+  ANSI formatting and sanitize invalid UTF-8 and control characters in them
+  (:pull:`10909`)
+
+- panel daddy: In single instance mode, run the command in the working
+  directory it was invoked from and do not pass internal environment variables
+  such as :code:`XDG_ACTIVATION_TOKEN` to it
+
+- Linux: Fix variable fonts that use axis values to substitute glyphs, such as
+  the cursive axis of Annotation Mono, not rendering the substituted glyphs
+  (:iss:`10897`)
+
+- macOS: Fix multiple font files sharing the same PostScript name sometimes
+  causing the wrong variant to be loaded (:iss:`10906`)
+
+0.51.0 [2026-11-18]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - Allow docking datty windows to an edge of the OS window, below the tab bar,
   with :code:`launch --type=os-window-dock`. The dock is shown in every tab of
-  the OS window, see :ref:`docks` (:iss:`10854`)
-
-- Allow resizing docks by dragging their inner border or with the
-  :ac:`resize_window` action and :code:`daddy @ resize-window`, see :ref:`docks`
-  (:iss:`10857`)
+  the OS window and can be resized by dragging its inner border or with the
+  :ac:`resize_window` action and :code:`daddy @ resize-window`, see
+  :ref:`docks` (:iss:`10854`, :iss:`10857`)
 
 - :doc:`Custom shaders <custom-shaders>`: Add ``screen-shake`` shaders that shake
   a window on bell and new events and uniforms for command start/finish and
-  alternate screen enter/exit
+  alternate screen enter/exit (:iss:`10871`)
+
+- Allow running the programs in new windows via a wrapper command, such as to
+  open new windows inside the same container as the window they are opened
+  from, using a :file:`launch_wrapper.py` file in the datty config directory,
+  see :ref:`launch_wrapper` (:iss:`10858`)
 
 - :ref:`Watchers <watchers>`: ``on_close`` now reports why the window was
   closed, a new ``on_cwd_change`` event fires when the working directory changes
   and ``on_resize``/``on_focus_change`` calls are no longer dropped when many
   windows are created at once (:disc:`10828`, :iss:`10853`)
 
+- Tab bar: Allow selecting and copying text drawn outside the tabs, for example
+  by a custom :file:`tab_bar.py`, by dragging the mouse over it. Fix the bell
+  indicator not being shown for the active window when the OS window is not
+  focused and clicking the blank line below a tab in the vertical tab bar not
+  activating it (:iss:`10869`, :iss:`10880`, :iss:`10810`)
+
 - Sessions: Fix tabs and windows moved with :ac:`detach_tab`,
-  :ac:`detach_window` or drag and drop losing their session. :ac:`save_as_session`
-  no longer opens saved sessions in the wrong OS Window or tab and no longer
-  overwrites the session file with an empty one (:pull:`10851`, :pull:`10852`)
+  :ac:`detach_window` or drag and drop losing their session.
+  :ac:`save_as_session` no longer opens saved sessions in the wrong OS Window
+  or tab or overwrites the session file with an empty one, and its file name
+  prompt now shows and completes relative to the directory the session will be
+  saved in (:pull:`10851`, :pull:`10852`, :disc:`10867`)
 
-- Fix out of bounds memory accesses when a multi-line :doc:`text sizing
-  <text-sizing-protocol>` character is partially scrolled off the screen and a
-  combining char is then added to it or the window is resized
+- Security: Fix a program running in the terminal being able to hang datty by
+  using :doc:`edit-in-datty </shell-integration>` to set a window logo that is
+  a special file such as :file:`/dev/zero`, window logos and background images
+  must now be regular files. Fix the ssh daddy creating remote directories
+  such as :file:`~/.terminfo` world writable (:iss:`10834`)
 
-- Wayland: Allow using touchscreens with the client side window decorations to
-  close, minimize and maximize the window, and to move and resize it
-  (:pull:`10859`)
+- :doc:`choose-files <daddies/choose-files>`: Sanitize file names, archive
+  member names, ebook metadata and previewer output so they cannot inject
+  escape codes into the terminal. Fix hangs previewing special files and
+  various preview caching bugs (:pull:`10843`, :pull:`10850`)
 
-- A hard reset (:code:`RIS`) now clears the alternate screen as well
+- daddies: Fix a crash and changed colors when wrapping text that contains
+  extended SGR colors, such as the output of custom preview commands in
+  :doc:`choose-files <daddies/choose-files>`
 
-- Fix a program running in the terminal being able to hang datty by using
-  :doc:`edit-in-datty </shell-integration>` to set a window logo that is a
-  special file such as :file:`/dev/zero`. Window logos and background images
-  must now be regular files and image conversion is subject to a timeout
-
-- Fix the lower rows of a multi-line :doc:`text sizing <text-sizing-protocol>`
-  character being lost when resizing if the text after it is wrapped onto its
-  first row
+- Fix the display sometimes not being updated, for example after changes made
+  from timers or mouse actions while the OS window is idle, or for newly
+  displayed images until something else causes a redraw (:pull:`10878`,
+  :iss:`10875`)
 
 - Fix the scrolled back view jumping, and images, the cursor and the scrollbar
   getting out of sync with the text, when new output arrives
   (:pull:`10841`, :pull:`10847`)
 
+- Fix crashes and memory errors with multi-line characters from the
+  :doc:`text sizing protocol <text-sizing-protocol>` being partially scrolled
+  off screen or resized, and with the VS15 variation selector after a soft
+  wrapped wide emoji
+
 - Fix ``clear_terminal last_command``, jumping to the last visited prompt and
   :ac:`show_last_visited_command_output` using the wrong lines in various
   situations
 
-- ssh daddy: Fix remote directories such as :file:`~/.terminfo` being created
-  world writable (:iss:`10834`)
+- Treat the ConEmu OSC 9;9 escape code as a report of the current working
+  directory, like OSC 7, instead of showing it as a desktop notification. A
+  hard reset (:code:`RIS`) now clears the alternate screen as well
 
-- :doc:`dnd daddy <daddies/dnd>`: Fix the daddy failing to start in a directory
-  that is not writable (:iss:`10855`)
+- Fix glyphs that are slightly wider than their cell, such as the texture
+  healing alternates of the Monaspace and 0xProto fonts, being rendered
+  smaller than surrounding text and accents that hang to the left of wide
+  glyphs, such as polytonic Greek capitals, being cut off
 
-- :doc:`choose-files <daddies/choose-files>`: Fix hangs previewing special files
-  and various preview caching bugs (:pull:`10843`, :pull:`10850`)
+- Fix an invalid value for :opt:`shell`, such as one with an unterminated
+  quote, causing errors when opening or saving windows, instead fall back to
+  the login shell and report the error (:pull:`10888`)
+
+- IME: Move cursor position within pre-edit text (:iss:`10807`)
+
+- Bash integration: Find system wide startup files by scanning the bash
+  executable instead of guessing their location (:iss:`10819`)
+
+- Fix minor issues in various daddies: Unicode input not finding some
+  characters such as the pound sign when searching by name, dnd failing to
+  start in a non-writable directory and ask selecting the wrong choice on mouse
+  click when the dialog does not fit in the window (:iss:`10862`,
+  :iss:`10855`, :pull:`10883`)
 
 - :doc:`Pointer shapes <pointer-shapes>`: Fix animated pointers restarting
   unnecessarily and the shape not updating on alternate screen switches
   (:iss:`10838`)
 
-- Bash integration: Find system wide startup files by scanning the bash
-  executable instead of guessing their location (:iss:`10819`)
-
-- IME: Move cursor position within pre-edit text (:iss:`10807`)
-
-- Vertical tab bar: Fix clicking the blank line below a tab not activating it
-  (:iss:`10810`)
-
 - Remote control: Fix ``set-colors`` and ``get-colors`` handling of
   ``cursor_text_color`` (:iss:`10832`)
 
-- :doc:`Hints daddy </daddies/hints>`: Fix some custom regexes with lookarounds
-  finding no matches in non-ASCII text
-
-- :ref:`Unscrolling <unscroll>` the screen no longer overwrites the top line when
-  a top margin is set
-
-- macOS: Workaround for clicking notifications not focusing the correct OS
-  Window with multiple datty instances (:iss:`10805`)
-
-- Wayland: Fix a hang creating OS windows after an output is quickly plugged and
-  unplugged
+- Wayland: Allow using touchscreens with the client side window decorations.
+  Fix the decorations sometimes showing the wrong focus state and a hang
+  creating OS windows after an output is quickly plugged and unplugged
+  (:pull:`10859`, :pull:`10873`)
 
 - X11: Report X errors instead of exiting, fixing exits when clipboard
   requestors destroy their window early (:iss:`9248`)
 
-- Treat the ConEmu OSC 9;9 escape code as a report of the current working
-  directory, like OSC 7, and ignore other ConEmu OSC 9 numeric sub-commands
-  instead of showing them as desktop notifications
+- macOS: Workaround for clicking notifications not focusing the correct OS
+  Window with multiple datty instances (:iss:`10805`)
 
 
 0.50.0 [2026-11-03]
@@ -364,7 +586,7 @@ Detailed list of changes
   with many small partial updates (:iss:`10749`)
 
 - Performance: Faster growing of the GPU sprite cache, particularly on macOS,
-  less CPU usage with a non-zero :opt:`input_delay` and no continuous
+  less CPU usage with a non-zero ``input_delay`` and no continuous
   re-rendering when a selection is present and the window is scrolled back
   (:iss:`10714`)
 
@@ -520,7 +742,7 @@ Detailed list of changes
 
 - Reduce input latency by processing small amounts of program output, such as
   the echo of typed characters, immediately instead of waiting for
-  :opt:`input_delay` (:pull:`10560`)
+  ``input_delay`` (:pull:`10560`)
 
 - Drag and drop: Restore the previously active tab after dropping a dragged tab
   on the same OS window's tab bar, even if it was reordered after a hover switch
@@ -4740,7 +4962,7 @@ Detailed list of changes
 - macOS: When closing a top-level window only switch focus to the previous datty
   window if it is on the same workspace (:iss:`1379`)
 
-- macOS: Fix :opt:`sync_to_monitor` not working on Mojave.
+- macOS: Fix `sync_to_monitor` not working on Mojave.
 
 - macOS: Use the system cursor blink interval by default
   :opt:`cursor_blink_interval`.

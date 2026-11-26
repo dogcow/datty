@@ -309,6 +309,7 @@ static inline void
 cursor_trail_start_threshold(PyObject *src, Options *opts) {
     opts->cursor_trail_start_threshold_x = (int)PyLong_AsLong(PyTuple_GET_ITEM(src, 0));
     opts->cursor_trail_start_threshold_y = (int)PyLong_AsLong(PyTuple_GET_ITEM(src, 1));
+    opts->cursor_trail_only_at_prompt = PyObject_IsTrue(PyTuple_GET_ITEM(src, 2));
 }
 
 static inline void
@@ -735,6 +736,18 @@ tab_bar_margin_height(PyObject *val, Options *opts) {
     }
     opts->tab_bar_margin_height.outer = PyFloat_AsDouble(PyTuple_GET_ITEM(val, 0));
     opts->tab_bar_margin_height.inner = PyFloat_AsDouble(PyTuple_GET_ITEM(val, 1));
+}
+
+static inline void
+render_interval(PyObject *val, Options *opts) {
+    if (!PyTuple_Check(val) || PyTuple_GET_SIZE(val) != 2) {
+        PyErr_SetString(PyExc_TypeError, "render_interval is not a 2-item tuple");
+        return;
+    }
+    opts->render_interval.sync_to_monitor = PyObject_IsTrue(PyTuple_GET_ITEM(val, 0));
+    const double ms = PyFloat_AsDouble(PyTuple_GET_ITEM(val, 1));
+    if (PyErr_Occurred()) return;
+    opts->render_interval.min_interval = ms > 0 ? ms_double_to_monotonic_t(ms) : 0;
 }
 
 static inline void

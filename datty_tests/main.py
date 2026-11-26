@@ -136,6 +136,10 @@ class GoProc:
 
         env = os.environ.copy()
         env['DATTY_PATH_TO_DATTY_EXE'] = datty_exe()
+        # The simd experiment is needed for the simd package used by tools/simdstring
+        experiments = [x for x in env.get('GOEXPERIMENT', '').split(',') if x]
+        if 'simd' not in experiments and 'nosimd' not in experiments:
+            env['GOEXPERIMENT'] = ','.join(experiments + ['simd'])
         self.start_time = time.monotonic()
         self.end_time: float = 0.0
         self.tdir = mkdtemp(prefix='datty-go-tests-')
