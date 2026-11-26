@@ -774,10 +774,16 @@ affect newly created windows, not existing ones.
 
 opt(
     'scrollback_fill_enlarged_window',
-    'no',
+    'yes',
     option_type='to_bool',
     ctype='bool',
-    long_text='Fill new space with lines from the scrollback buffer after enlarging a window.',
+    long_text='''
+Fill new space with lines from the scrollback buffer after enlarging a window.
+This keeps text that has reached the bottom of the window at the bottom when the
+window gets taller, for example, when the native tab bar is hidden after closing
+the last other tab. When disabled, the text stays where it is and the new space
+is left blank below it.
+''',
 )
 
 opt(

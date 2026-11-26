@@ -657,7 +657,7 @@ class Options:
     resize_debounce_time: tuple[float, float] = (0.1, 0.5)
     resize_in_steps: bool = False
     restore_session_after_logout: bool = False
-    scrollback_fill_enlarged_window: bool = False
+    scrollback_fill_enlarged_window: bool = True
     scrollback_lines: int = 2000
     scrollback_pager: list[str] = ['less', '--chop-long-lines', '--RAW-CONTROL-CHARS', '+INPUT_LINE_NUMBER']
     scrollback_pager_history_size: int = 0

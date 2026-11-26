@@ -787,6 +787,31 @@ class TestScreen(BaseTest):
         s.resize(5, s.columns)
         self.assertEqual(s.cursor.x, 0)
 
+    def test_enlarging_keeps_text_at_bottom_by_default(self) -> None:
+        from datty.options.types import defaults
+
+        self.assertTrue(defaults.scrollback_fill_enlarged_window)
+        s = self.create_screen(cols=5, lines=5, scrollback=20, options={'scrollback_fill_enlarged_window': defaults.scrollback_fill_enlarged_window})
+        for i in range(12):
+            s.draw(str(i))
+            s.linefeed()
+            s.carriage_return()
+        s.draw('$')
+        self.ae(s.cursor.y, 4)
+        self.ae(str(s.line(0)), '8')
+        # the native tab bar being shown and then hidden again
+        s.resize(3, 5)
+        self.ae(s.cursor.y, 2)
+        self.ae(str(s.line(0)), '10')
+        s.resize(5, 5)
+        self.ae(s.cursor.y, 4)
+        self.ae(str(s.line(0)), '8')
+        self.ae(str(s.line(4)), '$')
+        s.resize(8, 5)
+        self.ae(s.cursor.y, 7)
+        self.ae(str(s.line(0)), '5')
+        self.ae(str(s.line(7)), '$')
+
     def test_scrollback_fill_after_resize(self):
         def prepare_screen(content=()):
             ans = self.create_screen(options={'scrollback_fill_enlarged_window': True})
