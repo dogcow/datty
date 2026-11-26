@@ -113,6 +113,7 @@ from .typing_compat import BossType, ChildType, EdgeLiteral, TabType, TypedDict
 from .utils import (
     color_as_int,
     docs_url,
+    is_same_executable,
     key_val_matcher,
     datty_ansi_sanitizer_pat,
     log_error,
@@ -200,7 +201,7 @@ class CwdRequest:
         if reported_cwd:
             ssh_daddy_cmdline = window.ssh_daddy_cmdline()
             if ssh_daddy_cmdline:
-                run_shell = argv[0] == resolved_shell(get_options())[0]
+                run_shell = is_same_executable(argv[0], resolved_shell(get_options())[0])
                 server_args = [] if run_shell else list(argv)
                 from daddies.ssh.utils import set_cwd_in_cmdline, set_env_in_cmdline, set_server_args_in_cmdline
 
@@ -448,8 +449,9 @@ class DeferredWatcherCalls:
     Deliver watcher calls on the next main loop tick, in order, using a single
     timer. Deferring prevents infinite recursion when a watcher causes the
     event it is watching (for example, resizing in on_resize). Using a single
-    timer prevents bursts of events from exhausting the fixed size timer table.
-    Calls made during delivery are delivered in the next batch.
+    queue guarantees delivery order, which separate timers with the same
+    trigger time do not. Calls made during delivery are delivered in the next
+    batch.
     """
 
     def __init__(self) -> None:
@@ -466,8 +468,6 @@ class DeferredWatcherCalls:
     def schedule(self) -> None:
         if not self.timer_id and self.pending:
             self.timer_id = add_timer(self.deliver, 0, False)
-            if not self.timer_id:
-                log_error(f'Failed to schedule delivery of {len(self.pending)} watcher calls, will retry on the next watched event')
 
     def deliver(self, timer_id: int | None) -> None:
         self.timer_id = 0
@@ -533,7 +533,8 @@ def as_text(
         f = screen.as_text_alternate
     else:
         f = screen.as_text_non_visual if add_history else screen.as_text
-    f(lines.append, as_ansi, add_wrap_markers)
+    # The history is put before the screen, see below, which continues its last bidi paragraph
+    f(lines.append, as_ansi, add_wrap_markers, add_history, False)
     ctext = ''
     if add_cursor:
         ctext += '\x1b[?25' + ('h' if screen.cursor_visible else 'l')
@@ -550,7 +551,7 @@ def as_text(
     if add_history:
         pht = pagerhist(screen, as_ansi, add_wrap_markers)
         h: list[str] = [pht] if pht else []
-        screen.as_text_for_history_buf(h.append, as_ansi, add_wrap_markers)
+        screen.as_text_for_history_buf(h.append, as_ansi, add_wrap_markers, bool(pht), True)
         if h:
             if as_ansi:
                 h[-1] += '\x1b[m'
@@ -776,13 +777,17 @@ class GlobalWatchers:
         raw_spec = get_options().watcher
         if raw_spec == self.options_spec:
             return self.ans
-        from .launch import load_watch_modules
-
         spec = raw_spec.copy()
         if self.extra:
             spec[self.extra] = self.extra
-        ans = load_watch_modules(spec.keys())
-        self.ans = Watchers() if ans is None else ans
+        if spec:
+            # Importing launch is slow, so do it only when there are watchers
+            from .launch import load_watch_modules
+
+            ans = load_watch_modules(spec.keys())
+            self.ans = Watchers() if ans is None else ans
+        else:
+            self.ans = Watchers()
         self.options_spec = raw_spec.copy()
         return self.ans
 
@@ -1236,7 +1241,7 @@ class Window:
             if self._title_bar_screen is None:
                 from .window_title_bar import WindowTitleBarScreen
 
-                self._title_bar_screen = WindowTitleBarScreen(self.os_window_id, cell_width, cell_height)
+                self._title_bar_screen = WindowTitleBarScreen(cell_width, cell_height)
             tb_geom = WindowGeometry(
                 left=g.left,
                 top=tb_top,
@@ -1245,7 +1250,7 @@ class Window:
                 xnum=0,
                 ynum=1,
             )
-            self._title_bar_screen.layout(tb_geom)
+            self._title_bar_screen.layout(tb_geom, cell_width)
             set_window_title_bar_render_data(
                 self.os_window_id,
                 self.tab_id,
@@ -1675,12 +1680,7 @@ class Window:
             self.last_focused_at = monotonic()
             update_ime_position_for_window(self.id, False, 1)
             self.program_status_seen_by_user()
-            changed = self.needs_attention
-            self.needs_attention = False
-            if changed:
-                tab = self.tabref()
-                if tab is not None:
-                    tab.relayout_borders()
+            self.clear_needs_attention()
             if self.last_cmd_end_notification is not None:
                 from .notifications import OnlyWhen
 
@@ -1692,6 +1692,13 @@ class Window:
             # Cancel IME composition after loses focus
             update_ime_position_for_window(self.id, False, -1)
 
+    def clear_needs_attention(self) -> None:
+        if self.needs_attention:
+            self.needs_attention = False
+            if (tab := self.tabref()) is not None:
+                tab.relayout_borders()
+                tab.mark_tab_bar_dirty()
+
     def title_changed(self, new_title: memoryview | None, is_base64: bool = False) -> None:
         self.child_title = process_title_from_child(new_title or memoryview(b''), is_base64, self.default_title)
         self.call_watchers(self.watchers.on_title_change, {'title': self.child_title, 'from_child': True})
@@ -1699,6 +1706,9 @@ class Window:
             self.title_updated()
 
     def on_cwd_change(self, raw_url: bytes) -> None:
+        if self._title_bar_screen is not None and (t := self.tabref()) is not None:
+            # {window.wd} in the title bar template may have changed
+            self.update_title_bar(is_active=t.active_window is self)
         if self.watchers.on_cwd_change:
             url = raw_url.decode('utf-8', 'replace')
             host = ''
@@ -1763,7 +1773,10 @@ class Window:
             env = self.child.foreground_environ
             env['DATTY_CHILD_CMDLINE'] = ' '.join(map(shlex.quote, self.child.cmdline))
             subprocess.Popen(cb, env=env, cwd=self.child.foreground_cwd, preexec_fn=clear_handled_signals)
-        if not self.is_active:
+        # Mark as needing attention unless the user is looking at this window,
+        # which requires both that it be the active window and that its OS
+        # window have keyboard focus. Attention is cleared when the window gains focus.
+        if not self.is_active or self.os_window_id != current_focused_os_window_id():
             changed = not self.needs_attention
             self.needs_attention = True
             tab = self.tabref()
@@ -2600,7 +2613,9 @@ class Window:
             # such windows are typically UI daddies. The actions are not
             # serializable anyway, so skip.
             return []
-        ans = ['launch']
+        from .session import escape_session_value
+
+        ans: list[str] = []
         if cwd:
             ans.append(f'--cwd={cwd}')
         if self.allow_remote_control:
@@ -2614,10 +2629,13 @@ class Window:
             if self.creation_spec.env:
                 for k, v in self.creation_spec.env:
                     if k not in ('DATTY_PIPE_DATA',):
-                        ans.append(f'--env={k}={v}')
+                        # Environment values are expanded again when launching the child.
+                        ans.append(f'--env={k}={escape_session_value(v)}')
             for cs in self.creation_spec.colors:
                 ans.append(f'--color={cs}')
             for wr in self.creation_spec.watchers:
+                # These are the paths as specified by the user, before expansion,
+                # so the expansion when loading the watcher must happen again.
                 ans.append(f'--watcher={wr}')
             if self.creation_spec.hold:
                 ans.append('--hold')
@@ -2631,7 +2649,8 @@ class Window:
         wl = get_window_logo_settings_if_not_default(self.os_window_id, self.tab_id, self.id)
         if wl is not None:
             logo_path, logo_alpha, logo_pos = wl
-            ans.extend((f'--logo={logo_path}', f'--logo-alpha={logo_alpha}'))
+            # set_logo() expands variables while resolving its path.
+            ans.extend((f'--logo={escape_session_value(logo_path)}', f'--logo-alpha={logo_alpha}'))
             xpos = ypos = ''
             if logo_pos[0] == logo_pos[2] != 0.5:
                 xpos = 'right' if logo_pos[0] else 'left'
@@ -2688,9 +2707,12 @@ class Window:
                         if fcmd:
                             make_exe_absolute(fcmd, pid)
                             unserialize_data['cmd_at_shell_startup'] = fcmd
-        ans.insert(1, unserialize_launch_flag + json.dumps(unserialize_data))
-        ans.extend(cmd)
-        return ans
+        # Session parsing expands variables in options once, so every option
+        # is escaped once here. Options whose already expanded values are
+        # expanded again when the window is created, such as --env, must be
+        # escaped once more where they are added above. The metadata and
+        # command are read verbatim.
+        return ['launch', unserialize_launch_flag + json.dumps(unserialize_data), *map(escape_session_value, ans), *cmd]
 
     # }}}
 

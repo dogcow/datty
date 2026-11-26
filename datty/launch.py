@@ -15,6 +15,7 @@ from .cli_stub import LaunchCLIOptions
 from .clipboard import set_clipboard_string, set_primary_selection
 from .constants import is_wayland
 from .fast_data_types import COLOR_LAYER_WINDOW, add_timer, get_boss, get_options, get_os_window_title, patch_color_profiles
+from .launch_wrapper import LaunchRequest
 from .options.utils import env as parse_env
 from .tabs import Tab, TabManager
 from .types import DockSpec, LayerShellConfig, OverlayType, dock_edges, parse_dock_spec, run_once
@@ -678,6 +679,7 @@ class LaunchKwds(TypedDict):
     hold: bool
     bias: float | None
     hold_after_ssh: bool
+    expand_cwd: bool
 
 
 def apply_colors(window: Window, spec: Sequence[str]) -> None:
@@ -762,6 +764,8 @@ def _launch(
     child_death_callback: Callable[[int, Exception | None], None] | None = None,
     startup_command_via_shell_integration: Sequence[str] | str = (),
     restored_scrollback: bytes = b'',
+    use_launch_wrapper: bool = True,
+    expand_cwd: bool = True,
 ) -> Window | None:
     source_window = boss.active_window_for_cwd
     if opts.source_window:
@@ -821,6 +825,7 @@ def _launch(
         'hold': False,
         'bias': None,
         'hold_after_ssh': False,
+        'expand_cwd': expand_cwd,
     }
     spacing = {}
     if opts.spacing:
@@ -910,10 +915,6 @@ def _launch(
                         elif x == '@last-line-on-screen':
                             x = str(screen.visual_line(screen.lines - 1) or '')
             final_cmd.append(x)
-        if rc_from_window is None and final_cmd:
-            exe = which(final_cmd[0])
-            if exe:
-                final_cmd[0] = exe
         kw['cmd'] = final_cmd
     if force_window_launch and opts.type not in non_window_launch_types and opts.type not in dock_launch_types:
         opts.type = 'window'
@@ -928,6 +929,10 @@ def _launch(
         cmd = kw['cmd']
         if not cmd:
             raise ValueError('The cmd to run must be specified when running a background process')
+        if rc_from_window is None:
+            # Background processes are not run via Child, which handles
+            # programs that are not in PATH, such as via exe_search_path
+            cmd = [which(cmd[0]) or cmd[0]] + cmd[1:]
         boss.run_background_process(
             cmd,
             cwd=kw['cwd'],
@@ -981,6 +986,7 @@ def _launch(
             tm.host_os_window_docks_in(tab)
             kw['os_window_dock'] = True
         watchers = load_watch_modules(opts.watcher)
+        launch_request = LaunchRequest(opts.type, source_window.id if source_window else None, tuple(parse_var(opts.var))) if use_launch_wrapper else None
         with Window.set_ignore_focus_changes_for_new_windows(opts.keep_focus):
             new_window: Window = tab.new_window(
                 env=env or None,
@@ -990,6 +996,7 @@ def _launch(
                 startup_command_via_shell_integration=startup_command_via_shell_integration,
                 restored_scrollback=restored_scrollback,
                 dock_owner=dock_owner,
+                launch_request=launch_request,
                 **kw,
             )
             new_window.created_in_session_name = add_to_session
@@ -1038,6 +1045,8 @@ def launch(
     child_death_callback: Callable[[int, Exception | None], None] | None = None,
     startup_command_via_shell_integration: Sequence[str] | str = (),
     restored_scrollback: bytes = b'',
+    use_launch_wrapper: bool = True,
+    expand_cwd: bool = True,
 ) -> Window | None:
     active = boss.active_window
     if opts.keep_focus and active:
@@ -1055,6 +1064,8 @@ def launch(
             child_death_callback,
             startup_command_via_shell_integration,
             restored_scrollback,
+            use_launch_wrapper,
+            expand_cwd,
         )
     finally:
         if opts.keep_focus and active:
@@ -1457,7 +1468,9 @@ def remote_edit(msg: str, window: Window) -> None:
         return
     cmdline = get_editor(path_to_edit=c.file_localpath, line_number=c.line_number)
     c.opts.source_window = c.opts.next_to = f'id:{window.id}'
-    w = launch(get_boss(), c.opts, cmdline)
+    # The editor edits a temporary file datty creates locally, so it must not
+    # be run via the user's launch wrapper, which might run it in a container
+    w = launch(get_boss(), c.opts, cmdline, use_launch_wrapper=False)
     if w is not None:
         c.source_window_id = window.id
         c.editor_window_id = w.id

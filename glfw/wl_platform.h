@@ -96,12 +96,6 @@ typedef struct wl_buffer *(*PFN_wl_cursor_image_get_buffer)(struct wl_cursor_ima
 #define wl_cursor_theme_get_cursor _glfw.wl.cursor.theme_get_cursor
 #define wl_cursor_image_get_buffer _glfw.wl.cursor.image_get_buffer
 
-typedef struct wl_egl_window *(*PFN_wl_egl_window_create)(struct wl_surface *, int, int);
-typedef void (*PFN_wl_egl_window_destroy)(struct wl_egl_window *);
-typedef void (*PFN_wl_egl_window_resize)(struct wl_egl_window *, int, int, int, int);
-#define wl_egl_window_create _glfw.wl.egl.window_create
-#define wl_egl_window_destroy _glfw.wl.egl.window_destroy
-#define wl_egl_window_resize _glfw.wl.egl.window_resize
 
 typedef enum _GLFWCSDSurface {
     CENTRAL_WINDOW,
@@ -179,7 +173,6 @@ typedef struct _GLFWwindowWayland {
     bool transparent;
     struct wl_surface *surface;
     bool waiting_for_swap_to_commit;
-    struct wl_egl_window *native;
     struct wl_callback *callback;
 
     struct {
@@ -213,12 +206,15 @@ typedef struct _GLFWwindowWayland {
             float y;
         } discrete, continuous;
 
-        /* Event timestamp in nanoseconds */
-        bool x_stop_received, y_stop_received;
+        bool x_stop_received, y_stop_received, source_received, direction_inverted_received, direction_inverted;
         uint32_t source_type;
-        monotonic_t x_start_time, x_stop_time, y_stop_time, y_start_time;
+        // The time of the latest axis or axis_stop event in the frame, on the clock of monotonic(), zero if none
+        monotonic_t time;
     } pointer_curr_axis_info;
     GLFWOffsetType prev_frame_offset_type;
+    // Axis state that compositors need not repeat in every frame of a gesture
+    GLFWScrollSource prev_frame_scroll_source;
+    bool prev_frame_direction_inverted, scroll_gesture_in_progress;
 
     _GLFWcursor *currentCursor;
     double cursorPosX, cursorPosY, allCursorPosX, allCursorPosY;
@@ -404,6 +400,14 @@ typedef struct _GLFWlibraryWayland {
     struct zwp_keyboard_shortcuts_inhibit_manager_v1 *keyboard_shortcuts_inhibit_manager;
     struct zwp_pointer_gestures_v1 *pointer_gestures;
     struct zwp_pointer_gesture_hold_v1 *pointer_gesture_hold;
+    struct zwp_input_timestamps_manager_v1 *input_timestamps_manager;
+    struct zwp_input_timestamps_v1 *pointer_timestamps;
+    // The high resolution time, in nanoseconds of the compositor clock, of the
+    // next wl_pointer event that carries a time, from the input timestamps protocol
+    struct {
+        uint64_t time_ns;
+        bool pending;
+    } pointer_hires_time;
     struct zxdg_output_manager_v1 *xdg_output_manager;
     // Outputs that have been bound but not yet announced to GLFW via
     // wl_output.done. They are not in _glfw.monitors yet but must still be
@@ -455,14 +459,6 @@ typedef struct _GLFWlibraryWayland {
         PFN_wl_cursor_theme_get_cursor theme_get_cursor;
         PFN_wl_cursor_image_get_buffer image_get_buffer;
     } cursor;
-
-    struct {
-        void *handle;
-
-        PFN_wl_egl_window_create window_create;
-        PFN_wl_egl_window_destroy window_destroy;
-        PFN_wl_egl_window_resize window_resize;
-    } egl;
 
     struct {
         glfw_wl_xdg_activation_request *array;
@@ -564,6 +560,7 @@ void _glfwCreateXdgOutputsWayland(void);
 void _glfwWaylandBeforeBufferSwap(_GLFWwindow *window);
 void _glfwWaylandAfterBufferSwap(_GLFWwindow *window);
 void _glfwWaylandSurfaceOutputsChanged(_GLFWwindow *window);
+void _glfwWaylandKeyboardFocusChanged(id_type window_id);
 void _glfwSetupWaylandDataDevice(void);
 void _glfwSetupWaylandPrimarySelectionDevice(void);
 double _glfwWaylandWindowScale(_GLFWwindow *);

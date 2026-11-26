@@ -1,6 +1,6 @@
 *_generated.*
 *-generated.*
-datty/gl-wrapper.*
+gpu/opengl/gl-wrapper.*
 datty/srgb_gamma.*
 datty/glfw-wrapper.*
 datty/rowcolumn-diacritics.c

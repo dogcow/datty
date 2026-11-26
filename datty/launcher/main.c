@@ -18,6 +18,7 @@
 #include <limits.h>
 #endif
 #include "launcher.h"
+#include "../monotonic.h"
 #include "utils.h"
 #define FOR_LAUNCHER
 #include "cli-parser-data_generated.h"
@@ -46,6 +47,9 @@ safe_realpath(const char *src, char *buf, size_t buf_sz) {
     return true;
 }
 #endif
+
+// The time at which the launcher started, used by --debug-startup
+static monotonic_t launch_time = 0;
 
 typedef struct {
     const char *exe, *exe_dir, *lc_ctype, *lib_dir, *config_dir;
@@ -121,6 +125,10 @@ set_datty_run_data(RunData *run_data, bool from_source, wchar_t *extensions_dir)
         return false;
     }
     S(cli_flags, cli_flags);
+    PyObject *lt = PyLong_FromLongLong(launch_time);
+    S(launch_time, lt);
+    PyObject *pit = PyLong_FromLongLong(monotonic_clock_now());
+    S(python_initialized_time, pit);
 
 #undef S
     int ret = PySys_SetObject("datty_run_data", ans);
@@ -399,8 +407,11 @@ offset_for_plus_subcommand(int argc, char **argv, const char *name) {
     return offset;
 }
 
+// full_argc/full_argv are the complete command line, used to re-exec on
+// --detach. They differ from cli_spec->original_argv for +daddy panel, where
+// original_argv starts at "panel", not at the executable.
 static void
-handle_fast_commandline(CLISpec *cli_spec, const char *instance_group_prefix) {
+handle_fast_commandline(CLISpec *cli_spec, const char *instance_group_prefix, int full_argc, char **full_argv) {
     CLIOptions opts = {0};
     RAII_CLISpec(subcommand_cli_spec);
 #define swap_cli_spec                                            \
@@ -445,6 +456,7 @@ handle_fast_commandline(CLISpec *cli_spec, const char *instance_group_prefix) {
             printf("detach: true\n");
             printf("detached_log: %s\n", detached_log ? detached_log : "");
             printf("session: %s\n", opts.session ? opts.session : "");
+            output_argv("detach_exec_argv", full_argc, full_argv);
             exit(0);
         } else {
             int fds[2] = {0};
@@ -494,7 +506,7 @@ handle_fast_commandline(CLISpec *cli_spec, const char *instance_group_prefix) {
             setenv("DATTY_EXEC_FOR_DETACH", pid_str, 1);
             char exe_path[PATH_MAX] = {0};
             read_exe_path(exe_path, PATH_MAX);
-            execv(exe_path, cli_spec->original_argv);
+            execv(exe_path, full_argv);
             fprintf(stderr, "Failed to execv() for --detach with exe_path: %s\n", exe_path);
             exit(1);
 #endif
@@ -538,7 +550,7 @@ delegate_to_daddy_if_possible(int argc, char **argv, char *exe_dir) {
         if (strcmp(daddy, "panel") == 0) {
             offset++;
             CLISpec t = {.original_argv = argv + offset, .original_argc = argc - offset};
-            handle_fast_commandline(&t, "panel");
+            handle_fast_commandline(&t, "panel", argc, argv);
             return true;
         }
     }
@@ -567,6 +579,7 @@ output_test_data(RunData *rd) {
 
 int
 main(int argc_, char *argv_[], char *envp[]) {
+    launch_time = monotonic_clock_now();
     if (argc_ < 1 || !argv_) {
         fprintf(stderr, "Invalid argc/argv\n");
         return 1;
@@ -624,7 +637,7 @@ main(int argc_, char *argv_[], char *envp[]) {
     bool handle_fast_commandline_called = delegate_to_daddy_if_possible(argva.count, argva.argv, exe_dir);
     bool ok = parse_and_check_datty_cli(&cli_spec, argva.count, argva.argv);
     if (!ok) return 1;
-    if (!handle_fast_commandline_called) handle_fast_commandline(&cli_spec, NULL);
+    if (!handle_fast_commandline_called) handle_fast_commandline(&cli_spec, NULL, argva.count, argva.argv);
     int ret = 0;
     char lib[PATH_MAX + 1] = {0};
     if (DATTY_LIB_PATH[0] == '/') {

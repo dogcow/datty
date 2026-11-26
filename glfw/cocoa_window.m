@@ -81,10 +81,8 @@ uti_to_mime(NSString *uti) {
         buf[j] = 0;
         return buf;
     }
-    if (@available(macOS 11.0, *)) {
-        UTType *t = [UTType typeWithIdentifier:uti]; // auto-released
-        if (t.preferredMIMEType != nil) return [t.preferredMIMEType UTF8String];
-    }
+    UTType *t = [UTType typeWithIdentifier:uti]; // auto-released
+    if (t.preferredMIMEType != nil) return [t.preferredMIMEType UTF8String];
     return "";
 }
 
@@ -475,6 +473,17 @@ releaseMonitor(_GLFWwindow *window) {
     _glfwRestoreVideoModeNS(window->monitor);
 }
 
+// Converts the time of an event, in seconds since system startup, to
+// monotonic() time. The clocks differ, so only the age of the event is used. See
+// MAX_INPUT_EVENT_AGE_SECONDS for implausible ages.
+static monotonic_t
+event_timestamp_to_monotonic(NSEvent *event) {
+    const monotonic_t now = monotonic();
+    const NSTimeInterval age = [[NSProcessInfo processInfo] systemUptime] - [event timestamp];
+    if (!(age >= 0 && age <= MAX_INPUT_EVENT_AGE_SECONDS)) return now;
+    return now - s_double_to_monotonic_t(age);
+}
+
 // Translates macOS key modifiers into GLFW ones
 //
 static int
@@ -679,7 +688,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
     }
     [currentScreenStates release];
 
-    if (window->context.client != GLFW_NO_API) [window->context.nsgl.object update];
+    _glfwInputNativeSurfaceChanged(window);
 
     if (_glfw.ns.disabledCursorWindow == window) _glfwCenterCursorInContentArea(window);
 
@@ -711,7 +720,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)windowDidMove:(NSNotification *)notification {
     (void)notification;
-    if (window->context.client != GLFW_NO_API) [window->context.nsgl.object update];
+    _glfwInputNativeSurfaceChanged(window);
 
     if (_glfw.ns.disabledCursorWindow == window) _glfwCenterCursorInContentArea(window);
 
@@ -751,7 +760,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
     if (_glfw.ns.disabledCursorWindow != window && cursorInContentArea(window)) {
         double x = 0, y = 0;
         _glfwPlatformGetCursorPos(window, &x, &y);
-        _glfwInputCursorPos(window, x, y);
+        _glfwInputCursorPos(window, x, y, 0);
     }
     // macOS will send a delayed event to update the cursor to arrow after switching desktops.
     // So we need to delay and update the cursor once after that.
@@ -777,7 +786,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 - (void)windowDidChangeScreen:(NSNotification *)notification {
     (void)notification;
     if (window->ns.renderFrameRequested && window->ns.renderFrameCallback) {
-        // Ensure that if the window changed its monitor, CVDisplayLink
+        // Ensure that if the window changed its monitor, the display link
         // is running for the new monitor
         requestRenderFrame(window, window->ns.renderFrameCallback);
     }
@@ -1024,13 +1033,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)updateLayer {
     if (!window) return;
-    if (window->context.client != GLFW_NO_API) {
-        @try {
-            [window->context.nsgl.object update];
-        } @catch (NSException *e) {
-            _glfwInputError(GLFW_PLATFORM_ERROR, "Failed to update NSGL Context object with error: %s (%s)", [[e name] UTF8String], [[e reason] UTF8String]);
-        }
-    }
+    _glfwInputNativeSurfaceChanged(window);
 
     _glfwInputWindowDamage(window);
 }
@@ -1047,7 +1050,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)mouseDown:(NSEvent *)event {
     if (!window) return;
-    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_LEFT, GLFW_PRESS, translateFlags([event modifierFlags]));
+    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_LEFT, GLFW_PRESS, translateFlags([event modifierFlags]), event_timestamp_to_monotonic(event));
 }
 
 - (void)mouseDragged:(NSEvent *)event {
@@ -1056,7 +1059,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)mouseUp:(NSEvent *)event {
     if (!window) return;
-    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_LEFT, GLFW_RELEASE, translateFlags([event modifierFlags]));
+    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_LEFT, GLFW_RELEASE, translateFlags([event modifierFlags]), event_timestamp_to_monotonic(event));
 }
 
 - (void)mouseMoved:(NSEvent *)event {
@@ -1065,13 +1068,13 @@ static void flush_focus_loss_text(_GLFWwindow *window);
         const double dx = [event deltaX] - window->ns.cursorWarpDeltaX;
         const double dy = [event deltaY] - window->ns.cursorWarpDeltaY;
 
-        _glfwInputCursorPos(window, window->virtualCursorPosX + dx, window->virtualCursorPosY + dy);
+        _glfwInputCursorPos(window, window->virtualCursorPosX + dx, window->virtualCursorPosY + dy, event_timestamp_to_monotonic(event));
     } else {
         const NSRect contentRect = [window->ns.view frame];
         // NOTE: The returned location uses base 0,1 not 0,0
         const NSPoint pos = [event locationInWindow];
 
-        _glfwInputCursorPos(window, pos.x, contentRect.size.height - pos.y);
+        _glfwInputCursorPos(window, pos.x, contentRect.size.height - pos.y, event_timestamp_to_monotonic(event));
     }
 
     window->ns.cursorWarpDeltaX = 0;
@@ -1085,7 +1088,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)rightMouseDown:(NSEvent *)event {
     if (!window) return;
-    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_RIGHT, GLFW_PRESS, translateFlags([event modifierFlags]));
+    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_RIGHT, GLFW_PRESS, translateFlags([event modifierFlags]), event_timestamp_to_monotonic(event));
 }
 
 - (void)rightMouseDragged:(NSEvent *)event {
@@ -1094,12 +1097,12 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)rightMouseUp:(NSEvent *)event {
     if (!window) return;
-    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_RIGHT, GLFW_RELEASE, translateFlags([event modifierFlags]));
+    _glfwInputMouseClick(window, GLFW_MOUSE_BUTTON_RIGHT, GLFW_RELEASE, translateFlags([event modifierFlags]), event_timestamp_to_monotonic(event));
 }
 
 - (void)otherMouseDown:(NSEvent *)event {
     if (!window) return;
-    _glfwInputMouseClick(window, (int)[event buttonNumber], GLFW_PRESS, translateFlags([event modifierFlags]));
+    _glfwInputMouseClick(window, (int)[event buttonNumber], GLFW_PRESS, translateFlags([event modifierFlags]), event_timestamp_to_monotonic(event));
 }
 
 - (void)otherMouseDragged:(NSEvent *)event {
@@ -1108,7 +1111,7 @@ static void flush_focus_loss_text(_GLFWwindow *window);
 
 - (void)otherMouseUp:(NSEvent *)event {
     if (!window) return;
-    _glfwInputMouseClick(window, (int)[event buttonNumber], GLFW_RELEASE, translateFlags([event modifierFlags]));
+    _glfwInputMouseClick(window, (int)[event buttonNumber], GLFW_RELEASE, translateFlags([event modifierFlags]), event_timestamp_to_monotonic(event));
 }
 
 - (void)mouseExited:(NSEvent *)event {
@@ -1427,7 +1430,10 @@ is_modifier_pressed(NSUInteger flags, NSUInteger target_mask, NSUInteger other_m
 
 - (void)scrollWheel:(NSEvent *)event {
     GLFWScrollEvent ev = {
-        .keyboard_modifiers = translateFlags([event modifierFlags]), .unscaled.x = [event scrollingDeltaX], .unscaled.y = [event scrollingDeltaY]};
+        .keyboard_modifiers = translateFlags([event modifierFlags]),
+        .unscaled.x = [event scrollingDeltaX],
+        .unscaled.y = [event scrollingDeltaY],
+        .timestamp = event_timestamp_to_monotonic(event)};
     ev.x_offset = ev.unscaled.x;
     ev.y_offset = ev.unscaled.y;
     if ([event hasPreciseScrollingDeltas]) {
@@ -1447,6 +1453,21 @@ is_modifier_pressed(NSUInteger flags, NSUInteger target_mask, NSUInteger other_m
         case NSEventPhaseMayBegin: ev.momentum_type = GLFW_MOMENTUM_PHASE_MAY_BEGIN; break;
         case NSEventPhaseNone: break;
     }
+    switch ([event phase]) {
+        case NSEventPhaseBegan: ev.phase = GLFW_SCROLL_PHASE_BEGAN; break;
+        case NSEventPhaseStationary:
+        case NSEventPhaseChanged: ev.phase = GLFW_SCROLL_PHASE_CHANGED; break;
+        case NSEventPhaseEnded: ev.phase = GLFW_SCROLL_PHASE_ENDED; break;
+        case NSEventPhaseCancelled: ev.phase = GLFW_SCROLL_PHASE_CANCELLED; break;
+        case NSEventPhaseMayBegin: ev.phase = GLFW_SCROLL_PHASE_MAY_BEGIN; break;
+        case NSEventPhaseNone: break;
+    }
+    // Only gesture based devices, trackpads and the Magic Mouse, have phases.
+    // Precise deltas without phases come from devices such as high resolution
+    // wheels that macOS does not identify.
+    if (ev.phase != GLFW_SCROLL_PHASE_NONE || ev.momentum_type != GLFW_NO_MOMENTUM_DATA) ev.source = GLFW_SCROLL_SOURCE_FINGER;
+    else ev.source = [event hasPreciseScrollingDeltas] ? GLFW_SCROLL_SOURCE_UNKNOWN : GLFW_SCROLL_SOURCE_WHEEL;
+    ev.direction_inverted = [event isDirectionInvertedFromDevice];
 
     _glfwInputScroll(window, &ev);
 }
@@ -2358,13 +2379,9 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     return NO;
 }
 
-#if (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 101400)
-
 - (NSAccessibilityRole)accessibilityRole {
     return NSAccessibilityTextAreaRole;
 }
-
-#endif
 
 - (NSString *)accessibilitySelectedText {
     NSString *text = nil;
@@ -2705,8 +2722,7 @@ createNativeWindow(_GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _
 //////////////////////////////////////////////////////////////////////////
 
 int
-_glfwPlatformCreateWindow(
-    _GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _GLFWctxconfig *ctxconfig, const _GLFWfbconfig *fbconfig, const GLFWLayerShellConfig *lsc) {
+_glfwPlatformCreateWindow(_GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _GLFWfbconfig *fbconfig, const GLFWLayerShellConfig *lsc) {
     window->ns.deadKeyState = 0;
     if (lsc) {
         window->ns.layer_shell.is_active = true;
@@ -2724,24 +2740,6 @@ _glfwPlatformCreateWindow(
         case DEFAULT_COLORSPACE: break;
     }
 
-    if (ctxconfig->client != GLFW_NO_API) {
-        if (ctxconfig->source == GLFW_NATIVE_CONTEXT_API) {
-            if (!_glfwInitNSGL()) return false;
-            if (!_glfwCreateContextNSGL(window, ctxconfig, fbconfig)) return false;
-        } else if (ctxconfig->source == GLFW_EGL_CONTEXT_API) {
-            // EGL implementation on macOS use CALayer* EGLNativeWindowType so we
-            // need to get the layer for EGL window surface creation.
-            [window->ns.view setWantsLayer:YES];
-            window->ns.layer = [window->ns.view layer];
-
-            if (!_glfwInitEGL()) return false;
-            if (!_glfwCreateContextEGL(window, ctxconfig, fbconfig)) return false;
-        } else if (ctxconfig->source == GLFW_OSMESA_CONTEXT_API) {
-            if (!_glfwInitOSMesa()) return false;
-            if (!_glfwCreateContextOSMesa(window, ctxconfig, fbconfig)) return false;
-        }
-    }
-
     if (window->monitor) {
         // Do not show the window here until after setting the window size, maximized state, and full screen
         // _glfwPlatformShowWindow(window);
@@ -2755,6 +2753,7 @@ _glfwPlatformCreateWindow(
 void
 _glfwPlatformDestroyWindow(_GLFWwindow *window) {
     GLFWWindow *w = window->ns.object;
+    _glfwPlatformSetWindowAttention(window, false);
     if (_glfw.ns.disabledCursorWindow == window) _glfw.ns.disabledCursorWindow = NULL;
     free_drop_data(window);
     if (window->ns.notch_cover_window) {
@@ -2767,8 +2766,6 @@ _glfwPlatformDestroyWindow(_GLFWwindow *window) {
     [w orderOut:nil];
 
     if (window->monitor) releaseMonitor(window);
-
-    if (window->context.destroy) window->context.destroy(window);
 
     [w setDelegate:nil];
     [window->ns.delegate cleanup];
@@ -3270,23 +3267,17 @@ _glfwPlatformHideWindow(_GLFWwindow *window) {
             if (_glfwPlatformWindowVisible(w)) num_visible++;
         }
         if (!num_visible) {
-            // yieldActivationToApplication was introduced in macOS 14 (Sonoma)
-            SEL selector = NSSelectorFromString(@"yieldActivationToApplication:");
-            if ([NSApp respondsToSelector:selector]) {
-                [NSApp performSelector:selector withObject:app];
-                [app activateWithOptions:0];
-            } else {
-#define NSApplicationActivateIgnoringOtherApps 2
-                [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-#undef NSApplicationActivateIgnoringOtherApps
-            }
+            [NSApp yieldActivationToApplication:app];
+            [app activateWithOptions:0];
         }
     }
 }
 
 void
-_glfwPlatformRequestWindowAttention(_GLFWwindow *window UNUSED) {
-    [NSApp requestUserAttention:NSInformationalRequest];
+_glfwPlatformSetWindowAttention(_GLFWwindow *window, bool requested) {
+    if (window->ns.attention_requested) [NSApp cancelUserAttentionRequest:window->ns.attention_request_id];
+    window->ns.attention_requested = requested && ![NSApp isActive];
+    if (window->ns.attention_requested) window->ns.attention_request_id = [NSApp requestUserAttention:NSInformationalRequest];
 }
 
 int
@@ -3716,9 +3707,7 @@ bool
 _glfwPlatformIsFullscreen(_GLFWwindow *w, unsigned int flags) {
     NSWindow *window = w->ns.object;
     bool traditional = !(flags & 1);
-    if (traditional) {
-        if (@available(macOS 10.15.7, *)) return w->ns.in_traditional_fullscreen;
-    }
+    if (traditional) return w->ns.in_traditional_fullscreen;
     NSWindowStyleMask sm = [window styleMask];
     return sm & NSWindowStyleMaskFullScreen;
 }
@@ -3747,30 +3736,28 @@ _glfwUpdateNotchCover(_GLFWwindow *w) {
         w->ns.notch_cover_window = nil;
     }
     if (!w->ns.in_traditional_fullscreen) return;
-    if (@available(macOS 12.0, *)) {
-        CGFloat insetTop = window.screen.safeAreaInsets.top;
-        if (insetTop <= 0) return;
-        NSRect sf = [window.screen frame];
-        NSWindow *bg_window = [[NSWindow alloc] initWithContentRect:sf styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
-        [bg_window setBackgroundColor:[NSColor clearColor]];
-        [bg_window setHasShadow:NO];
-        [bg_window setOpaque:NO];
-        [bg_window setIgnoresMouseEvents:YES];
-        [bg_window setReleasedWhenClosed:NO];
-        [bg_window setColorSpace:[window colorSpace]];
-        // Add a colored subview only in the notch strip area
-        NSView *notchView = [[NSView alloc] initWithFrame:NSMakeRect(0, sf.size.height - insetTop, sf.size.width, insetTop)];
-        notchView.wantsLayer = YES;
-        unsigned int c = w->ns.notch_cover_color;
-        float a = w->ns.notch_cover_opacity;
-        notchView.layer.backgroundColor =
-            [NSColor colorWithSRGBRed:((c >> 16) & 0xFF) / 255.0 green:((c >> 8) & 0xFF) / 255.0 blue:(c & 0xFF) / 255.0 alpha:a].CGColor;
-        [bg_window.contentView addSubview:notchView];
-        // must be above otherwise shadow of main window is rendered over bg_window
-        [window addChildWindow:bg_window ordered:NSWindowAbove];
-        w->ns.notch_cover_window = bg_window;
-        [notchView release];
-    }
+    CGFloat insetTop = window.screen.safeAreaInsets.top;
+    if (insetTop <= 0) return;
+    NSRect sf = [window.screen frame];
+    NSWindow *bg_window = [[NSWindow alloc] initWithContentRect:sf styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    [bg_window setBackgroundColor:[NSColor clearColor]];
+    [bg_window setHasShadow:NO];
+    [bg_window setOpaque:NO];
+    [bg_window setIgnoresMouseEvents:YES];
+    [bg_window setReleasedWhenClosed:NO];
+    [bg_window setColorSpace:[window colorSpace]];
+    // Add a colored subview only in the notch strip area
+    NSView *notchView = [[NSView alloc] initWithFrame:NSMakeRect(0, sf.size.height - insetTop, sf.size.width, insetTop)];
+    notchView.wantsLayer = YES;
+    unsigned int c = w->ns.notch_cover_color;
+    float a = w->ns.notch_cover_opacity;
+    notchView.layer.backgroundColor =
+        [NSColor colorWithSRGBRed:((c >> 16) & 0xFF) / 255.0 green:((c >> 8) & 0xFF) / 255.0 blue:(c & 0xFF) / 255.0 alpha:a].CGColor;
+    [bg_window.contentView addSubview:notchView];
+    // must be above otherwise shadow of main window is rendered over bg_window
+    [window addChildWindow:bg_window ordered:NSWindowAbove];
+    w->ns.notch_cover_window = bg_window;
+    [notchView release];
 }
 
 bool
@@ -3781,60 +3768,43 @@ _glfwPlatformToggleFullscreen(_GLFWwindow *w, unsigned int flags) {
     bool ignore_safe_area_insets = flags & 2;
     NSWindowStyleMask sm = [window styleMask];
     if (traditional) {
-        if (@available(macOS 10.15.7, *)) {
-            // As of Big Turd NSWindowStyleMaskFullScreen is no longer usable
-            // Also no longer compatible after a minor release of macOS 10.15.7
-            if (!w->ns.in_traditional_fullscreen) {
-                // Apple throws NSGenericException if setStyleMask: clears
-                // NSWindowStyleMaskFullScreen outside a transition (see #9572).
-                // Split View sets this flag via the system, so fall back to
-                // Cocoa fullscreen toggle instead of the traditional path.
-                if (sm & NSWindowStyleMaskFullScreen) {
-                    [window toggleFullScreen:nil];
-                    return false;
-                }
-                w->ns.pre_full_screen_style_mask = sm;
-                w->ns.pre_traditional_fullscreen_frame = [window frame];
-                [window setStyleMask:NSWindowStyleMaskBorderless];
-                [[NSApplication sharedApplication] setPresentationOptions:NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock];
-                NSRect screenFrame = [window.screen frame];
-                if (!ignore_safe_area_insets) {
-                    if (@available(macOS 12.0, *)) { screenFrame.size.height -= window.screen.safeAreaInsets.top; }
-                }
-                [window setFrame:screenFrame display:YES];
-                w->ns.in_traditional_fullscreen = true;
-                if (!ignore_safe_area_insets) _glfwUpdateNotchCover(w);
-            } else {
-                made_fullscreen = false;
-                if (sm & NSWindowStyleMaskFullScreen) {
-                    // Split View added NSWindowStyleMaskFullScreen on top of our
-                    // traditional fullscreen. We can't clear that flag directly
-                    // (NSGenericException), so trigger a Cocoa exit and defer the
-                    // traditional fullscreen cleanup to windowDidExitFullScreen:
-                    // which fires after macOS finishes its async transition (#9572).
-                    // Return true to prevent the caller from setting the window
-                    // frame during the Cocoa exit animation.
-                    [[NSApplication sharedApplication] setPresentationOptions:NSApplicationPresentationDefault];
-                    [window toggleFullScreen:nil];
-                    return true;
-                } else {
-                    [window setStyleMask:w->ns.pre_full_screen_style_mask];
-                    [[NSApplication sharedApplication] setPresentationOptions:NSApplicationPresentationDefault];
-                    w->ns.in_traditional_fullscreen = false;
-                    _glfwUpdateNotchCover(w);
-                }
+        if (!w->ns.in_traditional_fullscreen) {
+            // Apple throws NSGenericException if setStyleMask: clears
+            // NSWindowStyleMaskFullScreen outside a transition (see #9572).
+            // Split View sets this flag via the system, so fall back to
+            // Cocoa fullscreen toggle instead of the traditional path.
+            if (sm & NSWindowStyleMaskFullScreen) {
+                [window toggleFullScreen:nil];
+                return false;
             }
+            w->ns.pre_full_screen_style_mask = sm;
+            w->ns.pre_traditional_fullscreen_frame = [window frame];
+            [window setStyleMask:NSWindowStyleMaskBorderless];
+            [[NSApplication sharedApplication] setPresentationOptions:NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock];
+            NSRect screenFrame = [window.screen frame];
+            if (!ignore_safe_area_insets) screenFrame.size.height -= window.screen.safeAreaInsets.top;
+            [window setFrame:screenFrame display:YES];
+            w->ns.in_traditional_fullscreen = true;
+            if (!ignore_safe_area_insets) _glfwUpdateNotchCover(w);
         } else {
-            bool in_fullscreen = sm & NSWindowStyleMaskFullScreen;
-            if (!(in_fullscreen)) {
-                sm |= NSWindowStyleMaskBorderless | NSWindowStyleMaskFullScreen;
-                [[NSApplication sharedApplication] setPresentationOptions:NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock];
-            } else {
-                made_fullscreen = false;
-                sm &= ~(NSWindowStyleMaskBorderless | NSWindowStyleMaskFullScreen);
+            made_fullscreen = false;
+            if (sm & NSWindowStyleMaskFullScreen) {
+                // Split View added NSWindowStyleMaskFullScreen on top of our
+                // traditional fullscreen. We can't clear that flag directly
+                // (NSGenericException), so trigger a Cocoa exit and defer the
+                // traditional fullscreen cleanup to windowDidExitFullScreen:
+                // which fires after macOS finishes its async transition (#9572).
+                // Return true to prevent the caller from setting the window
+                // frame during the Cocoa exit animation.
                 [[NSApplication sharedApplication] setPresentationOptions:NSApplicationPresentationDefault];
+                [window toggleFullScreen:nil];
+                return true;
+            } else {
+                [window setStyleMask:w->ns.pre_full_screen_style_mask];
+                [[NSApplication sharedApplication] setPresentationOptions:NSApplicationPresentationDefault];
+                w->ns.in_traditional_fullscreen = false;
+                _glfwUpdateNotchCover(w);
             }
-            [window setStyleMask:sm];
         }
         // Changing the style mask causes the first responder to be cleared
         [window makeFirstResponder:w->ns.view];
@@ -3978,40 +3948,8 @@ _glfwPlatformSetClipboard(GLFWClipboardType t) {
 }
 // }}}
 
-EGLenum
-_glfwPlatformGetEGLPlatform(EGLint **attribs) {
-    if (_glfw.egl.ANGLE_platform_angle) {
-        int type = 0;
-
-        if (_glfw.egl.ANGLE_platform_angle_opengl) {
-            if (_glfw.hints.init.angleType == GLFW_ANGLE_PLATFORM_TYPE_OPENGL) type = EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE;
-        }
-
-        if (_glfw.egl.ANGLE_platform_angle_metal) {
-            if (_glfw.hints.init.angleType == GLFW_ANGLE_PLATFORM_TYPE_METAL) type = EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE;
-        }
-
-        if (type) {
-            *attribs = calloc(3, sizeof(EGLint));
-            (*attribs)[0] = EGL_PLATFORM_ANGLE_TYPE_ANGLE;
-            (*attribs)[1] = type;
-            (*attribs)[2] = EGL_NONE;
-            return EGL_PLATFORM_ANGLE_ANGLE;
-        }
-    }
-
-    return 0;
-}
-
-EGLNativeDisplayType
-_glfwPlatformGetEGLNativeDisplay(void) {
-    return EGL_DEFAULT_DISPLAY;
-}
-
-EGLNativeWindowType
-_glfwPlatformGetEGLNativeWindow(_GLFWwindow *window) {
-    return window->ns.layer;
-}
+void
+_glfwPlatformWindowContentsPresented(_GLFWwindow *window UNUSED) {}
 
 void
 _glfwPlatformGetRequiredInstanceExtensions(char **extensions) {
@@ -4118,6 +4056,15 @@ glfwGetCocoaWindow(GLFWwindow *handle) {
 
     _GLFW_REQUIRE_INIT_OR_RETURN(nil);
     return window->ns.object;
+}
+
+GLFWAPI id
+glfwGetCocoaView(GLFWwindow *handle) {
+    _GLFWwindow *window = (_GLFWwindow *)handle;
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(nil);
+    return window->ns.view;
 }
 
 GLFWAPI GLFWcocoatextinputfilterfun
