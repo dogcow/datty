@@ -302,7 +302,9 @@ class BaseTest(TestCase):
         set_options(None)
 
     def set_options(self, options=None):
-        final_options = {'scrollback_pager_history_size': 1024, 'click_interval': 0.5}
+        # scrollback_fill_enlarged_window is on by default in datty, the tests
+        # for resizing are written for it being off, as it is in kitty
+        final_options = {'scrollback_pager_history_size': 1024, 'click_interval': 0.5, 'scrollback_fill_enlarged_window': False}
         if options:
             final_options.update(options)
         options = Options(merge_result_dicts(defaults._asdict(), final_options))
