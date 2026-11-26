@@ -2540,6 +2540,19 @@ glfwCocoaAddWindowToTabGroup(GLFWwindow *parent_handle, GLFWwindow *child_handle
 }
 
 GLFWAPI int
+glfwCocoaTabBarHeight(GLFWwindow *handle) {
+    // The height of the native tab bar currently taken out of the content area of this window, in logical pixels.
+    // Measured rather than asked of the tab group, as the content view is resized some time after the tab bar is shown or hidden.
+    _GLFWwindow *window = (_GLFWwindow *)handle;
+    if (!window || !window->ns.view || !tab_eligible(window)) return 0;
+    NSWindow *nswindow = window->ns.object;
+    const NSRect without_tab_bar = [NSWindow contentRectForFrameRect:nswindow.frame styleMask:nswindow.styleMask];
+    const NSRect content = get_window_size_without_border_in_logical_pixels(window);
+    const CGFloat ans = without_tab_bar.size.height - content.size.height;
+    return ans > 0 ? (int)ans : 0;
+}
+
+GLFWAPI int
 glfwCocoaCycleTabs(GLFWwindow *handle, int delta) {
     _GLFWwindow *window = (_GLFWwindow *)handle;
     if (!window || !window->ns.object || delta == 0) return false;

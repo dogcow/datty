@@ -1488,6 +1488,20 @@ close_os_window(ChildMonitor *self, OSWindow *os_window) {
     int x = 0, y = 0;
     if (os_window->handle && !global_state.is_wayland) glfwGetWindowPos(os_window->handle, &x, &y);
     bool is_layer_shell = os_window->is_layer_shell;
+#ifdef __APPLE__
+    if (os_window->handle && !is_layer_shell && !is_os_window_fullscreen(os_window) && glfwCocoaTabBarHeight) {
+        // The native tab bar is taken out of the content area and a new OS
+        // window starts without one, so remember the geometry the content
+        // area has without the tab bar. Otherwise the remembered window
+        // shrinks by the height of the tab bar every time. The size is read
+        // from the window as closing the other tabs changes it without
+        // os_window being updated yet.
+        const int tab_bar_height = glfwCocoaTabBarHeight(os_window->handle);
+        glfwGetWindowSize(os_window->handle, &w, &h);
+        h += tab_bar_height;
+        y -= tab_bar_height;
+    }
+#endif
     bool was_maximized = false;
     if (os_window->handle && !is_layer_shell) {
         if (os_window->before_fullscreen.is_set && is_os_window_fullscreen(os_window)) {
