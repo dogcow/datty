@@ -17,7 +17,8 @@
 /linux-package/
 /datty.app/
 /glad/out/
-/datty/launcher/kitt*
+/datty/launcher/datty*
+/datty/launcher/daddy
 /*.dSYM/
 __pycache__/
 /glfw/wayland-*-client-protocol.[ch]

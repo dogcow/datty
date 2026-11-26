@@ -2240,11 +2240,12 @@ def package(args: Options, bundle_type: str, do_build_all: bool = True) -> None:
 
 
 def clean_launcher_dir(launcher_dir: str) -> None:
-    for x in glob.glob(os.path.join(launcher_dir, 'kitt*')):
-        if os.path.isdir(x):
-            shutil.rmtree(x)
-        else:
-            os.remove(x)
+    for pattern in ('datty*', 'daddy'):
+        for x in glob.glob(os.path.join(launcher_dir, pattern)):
+            if os.path.isdir(x):
+                shutil.rmtree(x)
+            else:
+                os.remove(x)
 
 
 def clean(for_cross_compile: bool = False) -> None:
